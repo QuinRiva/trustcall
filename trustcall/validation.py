@@ -12,7 +12,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
-from langgraph.prebuilt.tool_validator import ValidationNode, get_executor_for_config
+from langgraph.prebuilt import ValidationNode
 from dataclasses import asdict
 
 logger = logging.getLogger("extraction")
@@ -26,6 +26,20 @@ class _ExtendedValidationNode(ValidationNode):
         self.enable_deletes = enable_deletes
 
     def _func(self, input: Any, config: RunnableConfig) -> Any:  # type: ignore
+# --- Minimal logging at the very start of _func ---
+        logger.debug(f"ENTERING Validation node _func. Input type: {type(input)}")
+        # --- End minimal logging ---
+# --- Add logging at the start of _func ---
+        logger.debug(f"Validation node _func received input type: {type(input)}")
+        if isinstance(input, dict):
+             logger.debug(f"Validation node _func received input keys: {list(input.keys())}")
+        elif hasattr(input, '__dict__'): # Check if it's an object with attributes
+             logger.debug(f"Validation node _func received input attributes: {list(input.__dict__.keys())}")
+        elif isinstance(input, AIMessage):
+             logger.warning(f"Validation node _func received AIMessage directly! ID: {input.id}")
+        else:
+             logger.debug(f"Validation node _func received input value preview: {repr(input)[:500]}...")
+        # --- End logging ---
         """Validate and run tool calls synchronously."""
         output_type, message = self._get_message(asdict(input))
         removal_schema = None
@@ -34,19 +48,23 @@ class _ExtendedValidationNode(ValidationNode):
             removal_schema = _create_remove_doc_from_existing(input.existing)
             
         # ADDED: Get the current attempt count from the state
-        attempt_count = input.attempts if hasattr(input, 'attempts') else 1
+        attempt_count = input.attempts if hasattr(input
+                                                  , 'attempts') else 1
+        # ADDED: Get validation_context from state, default to empty dict if missing
+        user_validation_context = getattr(input, 'validation_context', None) or {}
 
         def run_one(call: ToolCall): # type: ignore
             try:
+                # Accessing call["name"] and call["args"] happens below
                 if removal_schema and call["name"] == removal_schema.__name__:
                     schema = removal_schema
                 else:
                     schema = self.schemas_by_name[call["name"]]
                 try:
-                    # ADDED: Create validation context with attempt count
-                    validation_context = {"attempt_count": attempt_count}
-                    # MODIFIED: Pass context to model_validate
-                    output = schema.model_validate(call["args"], context=validation_context)
+                    # MODIFIED: Create merged validation context
+                    merged_context = {"attempt_count": attempt_count, **user_validation_context}
+                    # MODIFIED: Pass merged context to model_validate
+                    output = schema.model_validate(call["args"], context=merged_context)
                     return ToolMessage(
                         content=output.model_dump_json(),
                         name=call["name"],
@@ -75,9 +93,9 @@ class _ExtendedValidationNode(ValidationNode):
                     status="error",
                 )
 
-        with get_executor_for_config(config) as executor:
-            outputs = [*executor.map(run_one, message.tool_calls)]
-            if output_type == "list":
-                return outputs
-            else:
-                return {"messages": outputs}
+        # Apply run_one to each tool call sequentially
+        outputs = list(map(run_one, message.tool_calls))
+        if output_type == "list":
+            return outputs
+        else:
+            return {"messages": outputs}

@@ -100,11 +100,13 @@ class _Extract:
     async def ainvoke(self, state: ExtractionState, config: RunnableConfig) -> dict:
         """Extract entities from the input messages."""
         msg = await self.bound_llm.ainvoke(state.messages, config)
+        logger.debug(f"_Extract ainvoke received LLM msg: {repr(msg)[:300]}...{repr(msg)[-300:]}")
         return self._tear_down(cast(AIMessage, msg))
 
     def invoke(self, state: ExtractionState, config: RunnableConfig) -> dict:
         """Extract entities from the input messages."""
         msg = self.bound_llm.invoke(state.messages, config)
+        logger.debug(f"_Extract invoke received LLM msg: {repr(msg)[:300]}...{repr(msg)[-300:]}")
         return self._tear_down(msg)
 
     def as_runnable(self):
@@ -481,6 +483,7 @@ class _ExtractUpdates:
         messages, existing, removal_schema, bound_model = self._setup(state)
         try:
             msg = await bound_model.ainvoke(messages, config)
+            logger.debug(f"_ExtractUpdates ainvoke received LLM msg: {repr(msg)[:300]}...{repr(msg)[-300:]}")
             return {
                 **self._teardown(cast(AIMessage, msg), existing),
                 "removal_schema": removal_schema,
@@ -500,6 +503,7 @@ class _ExtractUpdates:
         messages, existing, removal_schema, bound_model = self._setup(state)
         try:
             msg = bound_model.invoke(messages, config)
+            logger.debug(f"_ExtractUpdates invoke received LLM msg: {repr(msg)[:300]}...{repr(msg)[-300:]}")
             return {**self._teardown(msg, existing), "removal_schema": removal_schema}
         except Exception as e:
             return {

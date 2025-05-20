@@ -75,6 +75,8 @@ class ExtractionInputs(TypedDict, total=False):
     """Existing schemas. Key is the schema name, value is the schema instance.
     If a list, supports duplicate schemas to update.
     """
+    validation_context: Optional[Dict[str, Any]]
+    """Arbitrary context dictionary to pass to Pydantic validation."""
 
 
 InputsLike = Union[ExtractionInputs, List[AnyMessage], PromptValue, str]

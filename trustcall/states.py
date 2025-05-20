@@ -23,6 +23,9 @@ from langchain_core.messages import (
 from langchain_core.prompt_values import PromptValue
 from typing_extensions import Annotated, TypedDict
 import operator
+import logging # Corrected import
+
+logger = logging.getLogger(__name__) # Added logger instance back
 
 class MessageOp(TypedDict):
     op: Literal["delete", "update_tool_call", "update_tool_name"]
@@ -44,16 +47,51 @@ def _apply_message_ops(
             messages_ = []
             for m in messages:
                 if isinstance(m, AIMessage):
-                    old = m.tool_calls.copy()
-                    new = [
-                        targ if tc["id"] == targ["id"] else tc for tc in m.tool_calls
-                    ]
-                    if old != new:
-                        m = m.model_copy()
-                        m.tool_calls = new
-                        if m.additional_kwargs.get("tool_calls"):
-                            m.additional_kwargs["tool_calls"] = new
-                    messages_.append(m)
+                    # --- Logging Added ---
+                    updated_message = m # Start with original message
+                    original_tool_calls = m.tool_calls.copy()
+                    new_tool_calls = []
+                    update_applied = False
+                    for tc in original_tool_calls:
+                        if tc["id"] == targ["id"]:
+                            # --- Refined Logging ---
+                            # Log details BEFORE attempting update, focusing on list lengths
+                            target_id_str = targ.get('id', 'N/A')
+                            logger.debug(f"[_apply_message_ops] Attempting update_tool_call for id: {target_id_str}")
+                            original_classified_len = len(tc.get('args', {}).get('companies', [{}])[0].get('classified_documents', [])) if isinstance(tc.get('args'), dict) else 'N/A'
+                            original_missing_len = len(tc.get('args', {}).get('companies', [{}])[0].get('missing_documents', [])) if isinstance(tc.get('args'), dict) else 'N/A'
+                            logger.debug(f"[_apply_message_ops] Original counts (id: {target_id_str}): classified_docs={original_classified_len}, missing_docs={original_missing_len}")
+                            patched_classified_len = len(targ.get('args', {}).get('companies', [{}])[0].get('classified_documents', [])) if isinstance(targ.get('args'), dict) else 'N/A'
+                            patched_missing_len = len(targ.get('args', {}).get('companies', [{}])[0].get('missing_documents', [])) if isinstance(targ.get('args'), dict) else 'N/A'
+                            logger.debug(f"[_apply_message_ops] Patched counts (target): classified_docs={patched_classified_len}, missing_docs={patched_missing_len}")
+                            # --- End Refined Logging ---
+                            new_tool_calls.append(targ) # Use the target dict which contains patched args
+                            update_applied = True
+                        else:
+                            new_tool_calls.append(tc)
+
+                    if update_applied and original_tool_calls != new_tool_calls:
+                        # Create a copy to modify
+                        updated_message = m.model_copy()
+                        updated_message.tool_calls = new_tool_calls
+                        # Also update additional_kwargs if necessary (common pattern)
+                        if updated_message.additional_kwargs.get("tool_calls"):
+                             updated_message.additional_kwargs["tool_calls"] = new_tool_calls
+                        # --- Refined Logging ---
+                        # Log details AFTER attempting update, focusing on list lengths
+                        logger.debug(f"[_apply_message_ops] Update applied for id: {target_id_str}")
+                        # Find the updated tool call to log its list lengths
+                        final_tc = next((ntc for ntc in updated_message.tool_calls if ntc["id"] == target_id_str), None)
+                        if final_tc:
+                             final_classified_len = len(final_tc.get('args', {}).get('companies', [{}])[0].get('classified_documents', [])) if isinstance(final_tc.get('args'), dict) else 'N/A'
+                             final_missing_len = len(final_tc.get('args', {}).get('companies', [{}])[0].get('missing_documents', [])) if isinstance(final_tc.get('args'), dict) else 'N/A'
+                             logger.debug(f"[_apply_message_ops] Final counts in message (id: {target_id_str}): classified_docs={final_classified_len}, missing_docs={final_missing_len}")
+                        else:
+                             logger.error(f"[_apply_message_ops] ERROR: Updated tool call not found in message for id: {target_id_str}")
+                        # --- End Refined Logging ---
+                    else:
+                         logger.debug(f"[_apply_message_ops] No update applied or args identical for id: {target_id_str}")
+                    messages_.append(updated_message) # Append original or updated message
                 else:
                     messages_.append(m)
             messages = messages_
@@ -132,6 +170,8 @@ class ExtractionState:
     """Set once and never changed. The ID of the message to be patched."""
     existing: Optional[Dict[str, Any]] = field(default=None)
     """If you're updating an existing schema, provide the existing schema here."""
+    validation_context: Annotated[Optional[Dict[str, Any]], _keep_first] = field(default=None)
+    """Arbitrary context dictionary passed from input to Pydantic validation."""
 
 
 @dataclass(kw_only=True)

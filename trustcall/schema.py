@@ -9,6 +9,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import ast # Import ast
 from typing import (
     Any,
     Dict,
@@ -300,7 +301,8 @@ def _create_patch_function_errors_schema(for_gemini: bool = False) -> Type[BaseM
             " For each operation, write why your initial guess was incorrect, "
             " citing the corresponding types(s) from the JSONSchema"
             " that will be used the validate the resultant patched document."
-            "  Think step-by-step to ensure no error is overlooked.",
+            " Think step-by-step to ensure no error is overlooked."
+            " When planning to add a new list item (e.g., a missing document), plan a single `add` operation with the *complete* object as the value. Do NOT plan an `add` followed by `replace` operations on the fields of the newly added item.",
         )
         patches: list[patch_class] = Field(
             ...,
@@ -308,7 +310,8 @@ def _create_patch_function_errors_schema(for_gemini: bool = False) -> Type[BaseM
             " previous tool call's response arguments. If none are required, return"
             " an empty list. This field is REQUIRED."
             " Multiple patches in the list are applied sequentially in the order provided,"
-            " with each patch building upon the result of the previous one.",
+            " with each patch building upon the result of the previous one."
+            " When using the `add` operation to add an item to a list (e.g., `/path/to/list/-`), the `value` MUST be the **complete and valid** JSON object for that item. Do NOT generate subsequent `replace` operations in the *same* patch list that target indices or fields within the item you just added, as indices may shift and the operation can fail. Generate the complete item correctly in the initial `add` operation.",
         )
 
     return PatchFunctionErrors
@@ -475,12 +478,25 @@ def _ensure_patches(args: dict) -> list[Dict[str, Any]]:
                             try:
                                 parsed_value = json.loads(value)
                             except json.JSONDecodeError:
-                                # If parsing fails, use value as is
-                                parsed_value = value
+                                try:
+                                    # LLM might output a Python dict/list literal string
+                                    # e.g., "{'key': 'value'}" instead of {"key": "value"}
+                                    evaluated_value = ast.literal_eval(value)
+                                    if isinstance(evaluated_value, (dict, list)):
+                                        parsed_value = evaluated_value
+                                        logger.debug(f"Successfully parsed patch value string using ast.literal_eval: {value[:100]}...")
+                                    else:
+                                        # ast.literal_eval succeeded but not into a dict/list, keep original string
+                                        logger.warning(f"ast.literal_eval parsed patch value string but not to dict/list: {value[:100]}... Type: {type(evaluated_value)}")
+                                        parsed_value = value # Fallback to original string
+                                except (ValueError, SyntaxError, TypeError) as ast_e:
+                                    # Both json.loads and ast.literal_eval failed
+                                    logger.warning(f"Failed to parse patch value string as JSON or Python literal: {value[:100]}... Error: {ast_e}")
+                                    parsed_value = value # Fallback to original string
                                 
                         processed_patches.append({
-                            "op": op, 
-                            "path": path, 
+                            "op": op,
+                            "path": path,
                             "value": parsed_value
                         })
         

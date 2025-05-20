@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import asdict
 from typing import (
     Any,
     Dict,
@@ -30,7 +31,7 @@ from langgraph.types import Command
 from langgraph.utils.runnable import RunnableCallable
 
 from trustcall.schema import _ensure_patches, _create_patch_function_errors_schema, _create_patch_function_name_schema
-from trustcall.states import ExtendedExtractState, MessageOp
+from trustcall.states import ExtractionState, ExtendedExtractState, MessageOp
 from trustcall.utils import is_gemini_model
 from langchain_core.language_models import BaseChatModel
 
@@ -74,44 +75,76 @@ class _Patch:
             "attempts": 1 if bump_attempt else 0,
         }
 
+    def _get_target_id_and_bump(self, state: ExtractionState) -> tuple[Optional[str], bool]:
+        """Extract target tool_call_id and bump_attempt flag from state or messages."""
+        if hasattr(state, "tool_call_id") and state.tool_call_id:
+            # If ExtendedExtractState is somehow passed correctly, use its values
+            return state.tool_call_id, getattr(state, "bump_attempt", False)
+        else:
+            # Fallback: Find the ID from the last error ToolMessage in the history
+            target_id = None
+            for msg in reversed(state.messages):
+                if isinstance(msg, ToolMessage) and getattr(msg, "status", None) == "error":
+                    target_id = msg.tool_call_id
+                    break
+            # Assume bump_attempt should be True if we had to infer the ID
+            # (This matches the logic in handle_retries where bump_attempt is True for the first error found)
+            return target_id, bool(target_id)
+
     async def ainvoke(
-        self, state: ExtendedExtractState, config: RunnableConfig
+        self, state: ExtractionState, config: RunnableConfig # Changed type hint
     ) -> Command[Literal["sync", "__end__"]]:
-        """Generate a JSONPatch to correct the validation error and heal the tool call.
+        """Generate a JSONPatch to correct the validation error and heal the tool call."""
+        # --- Get target_id and bump_attempt safely ---
+        target_id, bump_attempt = self._get_target_id_and_bump(state)
+        if not target_id:
+             logger.error("_Patch ainvoke could not find target_id from messages.")
+             return Command(goto="__end__") # Cannot proceed without target_id
+        logger.debug(f"_Patch ainvoke using target_id: {target_id}, bump_attempt: {bump_attempt}")
+        # --- END Get target_id ---
 
-        Assumptions:
-            - We only support a single tool call to be patched.
-            - State's message list's last AIMessage contains the actual schema to fix.
-            - The last ToolMessage contains the tool call to fix.
-
-        """
         try:
+            # Pass only the messages to the LLM
             msg = await self.bound.ainvoke(state.messages, config)
-        except Exception:
+        except Exception as e:
+            logger.error(f"_Patch ainvoke LLM call failed: {e}")
             return Command(goto="__end__")
+            
         return Command(
             update=self._tear_down(
                 cast(AIMessage, msg),
                 state.messages,
-                state.tool_call_id,
-                state.bump_attempt,
+                target_id, # Use extracted target_id
+                bump_attempt, # Use extracted bump_attempt
             ),
             goto=("sync",),
         )
 
     def invoke(
-        self, state: ExtendedExtractState, config: RunnableConfig
+        self, state: ExtractionState, config: RunnableConfig # Changed type hint
     ) -> Command[Literal["sync", "__end__"]]:
+        """Generate a JSONPatch to correct the validation error and heal the tool call."""
+         # --- Get target_id and bump_attempt safely ---
+        target_id, bump_attempt = self._get_target_id_and_bump(state)
+        if not target_id:
+             logger.error("_Patch invoke could not find target_id from messages.")
+             return Command(goto="__end__") # Cannot proceed without target_id
+        logger.debug(f"_Patch invoke using target_id: {target_id}, bump_attempt: {bump_attempt}")
+        # --- END Get target_id ---
+
         try:
+             # Pass only the messages to the LLM
             msg = self.bound.invoke(state.messages, config)
-        except Exception:
+        except Exception as e:
+            logger.error(f"_Patch invoke LLM call failed: {e}")
             return Command(goto="__end__")
+            
         return Command(
             update=self._tear_down(
                 cast(AIMessage, msg),
                 state.messages,
-                state.tool_call_id,
-                state.bump_attempt,
+                target_id, # Use extracted target_id
+                bump_attempt, # Use extracted bump_attempt
             ),
             goto=("sync",),
         )
@@ -156,9 +189,17 @@ def _get_message_op(
                                     },
                                 })
                         except Exception as e:
-                            logger.error(f"Could not apply patch: {repr(e)}")
+                           # Enhanced logging for patch application failure
+                           logger.error(f"Error applying patch for target_id '{target_id}'. Exception: {repr(e)}", exc_info=True)
+                           logger.error(f"  Original Tool Call Args (containing patches): {tool_call}")
+                           # Log processed patches if available
+                           try:
+                               processed_patches = _ensure_patches(tool_call)
+                               logger.error(f"  Processed Patches: {processed_patches}")
+                           except Exception as ensure_e:
+                               logger.error(f"  Error during _ensure_patches: {repr(ensure_e)}")
                     else:
-                        logger.error(f"Unrecognized function call {tool_call_name}")
+                       logger.error(f"Unrecognized function call {tool_call_name}")
         
         # Add delete operations for tool messages
         if isinstance(m, ToolMessage) and m.tool_call_id == target_id:
