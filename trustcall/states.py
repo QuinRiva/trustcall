@@ -47,24 +47,12 @@ def _apply_message_ops(
             messages_ = []
             for m in messages:
                 if isinstance(m, AIMessage):
-                    # --- Logging Added ---
                     updated_message = m # Start with original message
                     original_tool_calls = m.tool_calls.copy()
                     new_tool_calls = []
                     update_applied = False
                     for tc in original_tool_calls:
                         if tc["id"] == targ["id"]:
-                            # --- Refined Logging ---
-                            # Log details BEFORE attempting update, focusing on list lengths
-                            target_id_str = targ.get('id', 'N/A')
-                            logger.debug(f"[_apply_message_ops] Attempting update_tool_call for id: {target_id_str}")
-                            original_classified_len = len(tc.get('args', {}).get('companies', [{}])[0].get('classified_documents', [])) if isinstance(tc.get('args'), dict) else 'N/A'
-                            original_missing_len = len(tc.get('args', {}).get('companies', [{}])[0].get('missing_documents', [])) if isinstance(tc.get('args'), dict) else 'N/A'
-                            logger.debug(f"[_apply_message_ops] Original counts (id: {target_id_str}): classified_docs={original_classified_len}, missing_docs={original_missing_len}")
-                            patched_classified_len = len(targ.get('args', {}).get('companies', [{}])[0].get('classified_documents', [])) if isinstance(targ.get('args'), dict) else 'N/A'
-                            patched_missing_len = len(targ.get('args', {}).get('companies', [{}])[0].get('missing_documents', [])) if isinstance(targ.get('args'), dict) else 'N/A'
-                            logger.debug(f"[_apply_message_ops] Patched counts (target): classified_docs={patched_classified_len}, missing_docs={patched_missing_len}")
-                            # --- End Refined Logging ---
                             new_tool_calls.append(targ) # Use the target dict which contains patched args
                             update_applied = True
                         else:
@@ -77,20 +65,8 @@ def _apply_message_ops(
                         # Also update additional_kwargs if necessary (common pattern)
                         if updated_message.additional_kwargs.get("tool_calls"):
                              updated_message.additional_kwargs["tool_calls"] = new_tool_calls
-                        # --- Refined Logging ---
-                        # Log details AFTER attempting update, focusing on list lengths
-                        logger.debug(f"[_apply_message_ops] Update applied for id: {target_id_str}")
-                        # Find the updated tool call to log its list lengths
-                        final_tc = next((ntc for ntc in updated_message.tool_calls if ntc["id"] == target_id_str), None)
-                        if final_tc:
-                             final_classified_len = len(final_tc.get('args', {}).get('companies', [{}])[0].get('classified_documents', [])) if isinstance(final_tc.get('args'), dict) else 'N/A'
-                             final_missing_len = len(final_tc.get('args', {}).get('companies', [{}])[0].get('missing_documents', [])) if isinstance(final_tc.get('args'), dict) else 'N/A'
-                             logger.debug(f"[_apply_message_ops] Final counts in message (id: {target_id_str}): classified_docs={final_classified_len}, missing_docs={final_missing_len}")
-                        else:
-                             logger.error(f"[_apply_message_ops] ERROR: Updated tool call not found in message for id: {target_id_str}")
-                        # --- End Refined Logging ---
                     else:
-                         logger.debug(f"[_apply_message_ops] No update applied or args identical for id: {target_id_str}")
+                        pass
                     messages_.append(updated_message) # Append original or updated message
                 else:
                     messages_.append(m)

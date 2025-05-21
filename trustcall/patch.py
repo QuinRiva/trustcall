@@ -18,6 +18,7 @@ from typing import (
 )
 
 import jsonpatch  # type: ignore[import-untyped]
+import jsonpointer  # type: ignore[import-untyped]
 import langsmith as ls
 from langchain_core.messages import (
     AIMessage,
@@ -100,7 +101,6 @@ class _Patch:
         if not target_id:
              logger.error("_Patch ainvoke could not find target_id from messages.")
              return Command(goto="__end__") # Cannot proceed without target_id
-        logger.debug(f"_Patch ainvoke using target_id: {target_id}, bump_attempt: {bump_attempt}")
         # --- END Get target_id ---
 
         try:
@@ -129,7 +129,6 @@ class _Patch:
         if not target_id:
              logger.error("_Patch invoke could not find target_id from messages.")
              return Command(goto="__end__") # Cannot proceed without target_id
-        logger.debug(f"_Patch invoke using target_id: {target_id}, bump_attempt: {bump_attempt}")
         # --- END Get target_id ---
 
         try:
@@ -179,25 +178,25 @@ def _get_message_op(
                         try:
                             patches = _ensure_patches(tool_call)
                             if patches:
-                                patched_args = jsonpatch.apply_patch(tc["args"], patches)
+                                patched_args = _apply_patch(tc["args"], patches) # Use local _apply_patch
                                 msg_ops.append({
-                                    "op": "update_tool_call",
-                                    "target": {
-                                        "id": target_id,
-                                        "name": tc["name"],
-                                        "args": patched_args,
-                                    },
-                                })
+                                        "op": "update_tool_call",
+                                        "target": {
+                                            "id": target_id,
+                                            "name": tc["name"],
+                                            "args": patched_args,
+                                        },
+                                    })
                         except Exception as e:
                            # Enhanced logging for patch application failure
                            logger.error(f"Error applying patch for target_id '{target_id}'. Exception: {repr(e)}", exc_info=True)
-                           logger.error(f"  Original Tool Call Args (containing patches): {tool_call}")
+                           logger.error(f"  Original Tool Call Args (tool_call['args'] which contains patches): {tool_call.get('args')}")
                            # Log processed patches if available
                            try:
-                               processed_patches = _ensure_patches(tool_call)
-                               logger.error(f"  Processed Patches: {processed_patches}")
+                               processed_patches = _ensure_patches(tool_call.get('args', {}))
+                               logger.error(f"  Processed Patches from tool_call['args']: {processed_patches}")
                            except Exception as ensure_e:
-                               logger.error(f"  Error during _ensure_patches: {repr(ensure_e)}")
+                               logger.error(f"  Error during _ensure_patches call: {repr(ensure_e)}")
                     else:
                        logger.error(f"Unrecognized function call {tool_call_name}")
         
@@ -220,3 +219,42 @@ def _infer_patch_message_ops(
         )
     ]
     return ops
+
+def _fix_string_concat(
+    doc: dict, patch: list[jsonpatch.JsonPatch]
+) -> Optional[list[jsonpatch.JsonPatch]] | None:
+    fixed = False
+    result = []
+    for p in patch:
+        if p["path"] and p["path"].endswith("/-"):
+            new_path = p["path"][:-2]
+            pointer = jsonpointer.JsonPointer(new_path)
+            try:
+                existing = pointer.resolve(doc)
+                if existing is not None and isinstance(existing, str):
+                    fixed = True
+                    result.append(
+                        {
+                            "path": new_path,
+                            "op": "replace",
+                            "value": existing + p["value"],
+                        }
+                    )
+                else:
+                    result.append(p)
+            except jsonpointer.JsonPointerException: # Path does not exist
+                result.append(p) # Keep original patch if path is invalid
+        else:
+            result.append(p)
+    if not fixed:
+        return None
+    return result
+
+def _apply_patch(doc: dict, patches: list[jsonpatch.JsonPatch]) -> dict:
+    try:
+        return jsonpatch.apply_patch(doc, patches)
+    except jsonpatch.JsonPatchConflict:
+        fixed = _fix_string_concat(doc, patches)
+        if fixed is not None:
+            return jsonpatch.apply_patch(doc, fixed)
+        raise

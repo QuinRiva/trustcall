@@ -39,7 +39,7 @@ from langgraph.utils.runnable import RunnableCallable
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
-from trustcall.patch import _Patch
+from trustcall.patch import _Patch, _apply_patch
 from trustcall.schema import (
     _create_remove_doc_from_existing,
     _get_schema,
@@ -70,11 +70,13 @@ class _Extract:
         tools: Sequence,
         tool_choice: Optional[str] = None,
         for_gemini: bool = False,
+        gemini_schema_recursion_depth: Optional[int] = None,
     ):
+        self.gemini_schema_recursion_depth = gemini_schema_recursion_depth
         # Create proper tool schemas based on the model type
         tool_schemas = []
         for t in tools:
-            schema = _get_schema(t, for_gemini)
+            schema = _get_schema(t, for_gemini, self.gemini_schema_recursion_depth)
             tool_dict = {
                 "type": "function",
                 "function": {
@@ -100,13 +102,11 @@ class _Extract:
     async def ainvoke(self, state: ExtractionState, config: RunnableConfig) -> dict:
         """Extract entities from the input messages."""
         msg = await self.bound_llm.ainvoke(state.messages, config)
-        logger.debug(f"_Extract ainvoke received LLM msg: {repr(msg)[:300]}...{repr(msg)[-300:]}")
         return self._tear_down(cast(AIMessage, msg))
 
     def invoke(self, state: ExtractionState, config: RunnableConfig) -> dict:
         """Extract entities from the input messages."""
         msg = self.bound_llm.invoke(state.messages, config)
-        logger.debug(f"_Extract invoke received LLM msg: {repr(msg)[:300]}...{repr(msg)[-300:]}")
         return self._tear_down(msg)
 
     def as_runnable(self):
@@ -132,7 +132,9 @@ class _ExtractUpdates:
         enable_updates: bool = True,
         enable_deletes: bool = False,
         existing_schema_policy: bool | Literal["ignore"] = True,
+        gemini_schema_recursion_depth: Optional[int] = None,
     ):
+        self.gemini_schema_recursion_depth = gemini_schema_recursion_depth
         if not any((enable_inserts, enable_updates, enable_deletes)):
             raise ValueError(
                 "At least one of enable_inserts, enable_updates,"
@@ -180,7 +182,7 @@ class _ExtractUpdates:
                     schema_str = "object"
                 else:
                     schema = self.tools[k]
-                    schema_json = _get_schema(schema, self.using_gemini)
+                    schema_json = _get_schema(schema, self.using_gemini, self.gemini_schema_recursion_depth)
                     schema_str = f"""
     <json_schema>
     {schema_json}
@@ -300,7 +302,7 @@ class _ExtractUpdates:
                                 ToolCall(
                                     id=tc["id"],
                                     name=tool_name,
-                                    args=jsonpatch.apply_patch(target, patches),
+                                    args=_apply_patch(target, patches), # Use local _apply_patch
                                 )
                             )
                             updated_docs[tc["id"]] = str(json_doc_id)
@@ -483,7 +485,6 @@ class _ExtractUpdates:
         messages, existing, removal_schema, bound_model = self._setup(state)
         try:
             msg = await bound_model.ainvoke(messages, config)
-            logger.debug(f"_ExtractUpdates ainvoke received LLM msg: {repr(msg)[:300]}...{repr(msg)[-300:]}")
             return {
                 **self._teardown(cast(AIMessage, msg), existing),
                 "removal_schema": removal_schema,
@@ -503,7 +504,6 @@ class _ExtractUpdates:
         messages, existing, removal_schema, bound_model = self._setup(state)
         try:
             msg = bound_model.invoke(messages, config)
-            logger.debug(f"_ExtractUpdates invoke received LLM msg: {repr(msg)[:300]}...{repr(msg)[-300:]}")
             return {**self._teardown(msg, existing), "removal_schema": removal_schema}
         except Exception as e:
             return {
@@ -531,6 +531,7 @@ def create_extractor(
     enable_updates: bool = True,
     enable_deletes: bool = False,
     existing_schema_policy: bool | Literal["ignore"] = True,
+    gemini_schema_recursion_depth: Optional[int] = None,
 ) -> Runnable[InputsLike, ExtractionOutputs]:
     """Create an extractor that generates validated structured outputs using an LLM.
 
@@ -556,6 +557,9 @@ def create_extractor(
             that don't match the provided tool. Useful for migrating or managing heterogenous
             docs. (default: True) True means raise error. False means treat as dict.
             "ignore" means ignore (drop any attempts to patch these)
+        gemini_schema_recursion_depth (Optional[int]): The maximum depth for inlining
+            recursive schemas when using Gemini models. If None, uses the default from
+            trustcall.schema. (default: None)
 
     Returns:
         Runnable[ExtractionInputs, ExtractionOutputs]: A runnable that
@@ -694,7 +698,7 @@ def create_extractor(
     def format_exception(error: BaseException, call: ToolCall, schema: Type[BaseModel]) -> str:
         return (
             f"Error:\n\n```\n{str(error)}\n```\n"
-            "Expected Parameter Schema:\n\n" + f"```json\n{_get_schema(schema, using_gemini)}\n```\n"
+            "Expected Parameter Schema:\n\n" + f"```json\n{_get_schema(schema, using_gemini, gemini_schema_recursion_depth)}\n```\n"
             f"Please use PatchFunctionErrors to fix all validation errors."
             f" for json_doc_id=[{call['id']}]."
         )
@@ -721,6 +725,7 @@ def create_extractor(
             _extract_tools,
             tool_choice,
             for_gemini=using_gemini,
+            gemini_schema_recursion_depth=gemini_schema_recursion_depth,
         ).as_runnable()
     )
     updater = _ExtractUpdates(
@@ -730,6 +735,7 @@ def create_extractor(
         enable_updates=enable_updates,  # type: ignore
         enable_deletes=enable_deletes,  # type: ignore
         existing_schema_policy=existing_schema_policy,
+        gemini_schema_recursion_depth=gemini_schema_recursion_depth,
     )
     builder.add_node(updater.as_runnable())
     builder.add_node(_Patch(llm, valid_tool_names=tool_names).as_runnable())
@@ -778,7 +784,8 @@ def create_extractor(
             if isinstance(m, AIMessage):
                 break
             if isinstance(m, ToolMessage):
-                if m.status == "error":
+                # Check additional_kwargs for "is_error" which is set by the new ValidationNode
+                if m.additional_kwargs.get("is_error") is True:
                     messages_for_fixing = _get_history_for_tool_call(
                         state.messages, m.tool_call_id
                     )
