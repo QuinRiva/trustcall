@@ -25,6 +25,7 @@ Works flexibly across a number of common LLM workflows like:
 - [Extracting complex schemas](#complex-schema)
 - [Updating schemas](#updating-schemas)
 - [Simultanous updates & insertions](#simultanous-updates--insertions)
+- [Advanced Configuration for `create_extractor`](#advanced-configuration-for-create_extractor)
 
 ## Why trustcall?
 
@@ -499,6 +500,79 @@ Output:
 </details>
 
 No fields omitted, and the important new information is seamlessly integrated.
+
+### Advanced Configuration for `create_extractor`
+
+The `create_extractor` function offers additional parameters to fine-tune its behavior, especially for complex scenarios or specific LLM backends.
+
+#### Controlling Schema Generation for Gemini Models
+
+When using Gemini models, `trustcall` internally transforms Pydantic schemas to be more compatible with Gemini's function calling requirements. This often involves inlining nested or recursive model definitions.
+
+*   **`gemini_schema_recursion_depth`** (Optional[int]):
+    *   This parameter, passed to `create_extractor`, controls how many levels deep recursive schema definitions (like a model that refers to itself or other models that refer back to it) are inlined when generating the schema specifically for a Gemini LLM.
+    *   **Purpose:** Gemini does not support `$ref` structures in JSON schemas. Inlining these references up to a certain depth can improve reliability.
+    *   **Default:** If not provided, it defaults to `5` (as defined by `DEFAULT_GEMINI_SCHEMA_GEN_DEPTH` in `trustcall.schema`).
+    *   **Usage:**
+        ```python
+        from trustcall import create_extractor
+        from langchain_google_vertexai import ChatVertexAI # Or any Gemini model
+
+        llm = ChatVertexAI(model_name="gemini-1.5-flash-001")
+        # Example: Limit inlining to 3 levels for Gemini
+        extractor = create_extractor(
+            llm,
+            tools=[YourPydanticModel],
+            gemini_schema_recursion_depth=3
+        )
+        ```
+
+#### Dynamic Pydantic Validation with Context
+
+`trustcall` allows you to pass contextual information into the Pydantic validation process, enabling more dynamic and adaptive validation logic within your Pydantic models.
+
+*   **`validation_context`** (Optional[Dict[str, Any]]):
+    *   When invoking the extractor, the input dictionary (of type `ExtractionInputs`) can include a `validation_context` key. This dictionary is passed through to Pydantic's `model_validate` method (specifically accessible via `info.context` in Pydantic V2 validators).
+    *   **Purpose:** Your Pydantic models (used as tool schemas) can access this context within their custom validators (e.g., `@field_validator` or `@model_validator`) via the `ValidationInfo` argument. This allows validation rules to change based on external factors.
+    *   **Usage with `invoke`:**
+        ```python
+        # Example:
+        # result = extractor.invoke({
+        #     "messages": [("user", "Some input text")],
+        #     "validation_context": {"my_custom_key": "my_value", "another_param": 123}
+        # })
+        ```
+    *   **Example:** Let's say you want an LLM to retrieve a value for each document provided to it as context. If a large number of documents are provided, it can get lazy and produce values for only a subset of those documents.  You can use `validation_context` to pass a list of `document_id`s, and then use the `@model_validator` to ensure that the LLM returns values for all of them.
+
+*   **`attempt_count` in Context:**
+    *   `trustcall` automatically injects the current retry `attempt_count` into the validation context. If you provide your own `validation_context`, `attempt_count` will be added to it. If you don't provide one, a context containing `attempt_count` will be created.
+    *   **Purpose:** This allows validators in your Pydantic models to know if it's the first validation attempt or a subsequent one (after a retry). This can be used, for example, to make validation rules more lenient on later attempts.
+    *   **Accessing in a Pydantic Model:**
+        ```python
+        from pydantic import BaseModel, field_validator, ValidationInfo
+        from typing import Optional
+
+        class MyToolSchema(BaseModel):
+            critical_field: str
+            optional_on_retry_field: Optional[str] = None
+
+            @field_validator('optional_on_retry_field', mode='before')
+            @classmethod
+            def validate_optional_on_retry(cls, v, info: ValidationInfo):
+                attempt = 0
+                if info.context:
+                    attempt = info.context.get("attempt_count", 0)
+                
+                if attempt > 0 and v is None: # Be more lenient on retries
+                    return "Default value on retry"
+                if v is None and attempt == 0:
+                    raise ValueError("'optional_on_retry_field' is required on the first attempt.")
+                return v
+        
+        # extractor = create_extractor(llm, tools=[MyToolSchema], ...)
+        # When this extractor runs and retries, MyToolSchema can adapt.
+        ```
+    *  **Example:** This is mostly useful when the data being retrieved **is actually** missing or incorrect.  If a @field_validator is used to ensure that the LLM returns a value for a date is a valid date, but the value in the document is **actually** `2024-02-30`, the @field_validator will raise an error.  By using `attempt_count` in the validation context, you be strict on the first attempt and lenient on subsequent attempts.
 
 ### Simultanous updates & insertions
 
