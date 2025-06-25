@@ -11,10 +11,15 @@ from typing import (
     Callable,
     Dict,
     List,
+    Set,
     Type,
     get_args,
 )
 
+import google.cloud.aiplatform_v1beta1.types as gapic
+from google.cloud.aiplatform_v1beta1.types import (
+    ToolConfig as GapicToolConfig,
+)
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -25,6 +30,7 @@ from langchain_core.messages import (
 )
 from langchain_core.prompt_values import PromptValue
 from langchain_core.tools import InjectedToolArg
+from pydantic import BaseModel, create_model as create_model_from_schema
 
 logger = logging.getLogger("extraction")
 
@@ -134,3 +140,77 @@ def _get_history_for_tool_call(messages: List[AnyMessage], tool_call_id: str):
                 continue
         results.append(m)
     return list(reversed(results))
+
+
+def _make_schema_gapic_compatible(schema_node: Any) -> Any:
+    """
+    Recursively traverses a JSON schema and makes it compatible with the
+    Google AI Platform GAPIC client library.
+    """
+    if isinstance(schema_node, dict):
+        new_node = schema_node.copy()
+
+        if "$ref" in new_node:
+            ref_val = new_node["$ref"]
+            # Gemini expects just the definition name, e.g., "Address"
+            return {"ref": ref_val.split('/')[-1]}
+
+        if "$defs" in new_node:
+            new_node["defs"] = new_node.pop("$defs")
+
+        for key, value in new_node.items():
+            new_node[key] = _make_schema_gapic_compatible(value)
+
+        if "type" in new_node and isinstance(new_node["type"], str):
+            new_node["type"] = new_node["type"].upper()
+
+        if "anyOf" in new_node:
+            non_null_schema = next(
+                (item for item in new_node["anyOf"] if item.get("type") != "NULL"), None
+            )
+            if non_null_schema:
+                del new_node["anyOf"]
+                new_node.update(non_null_schema)
+                if "type" in new_node and isinstance(new_node["type"], str):
+                    new_node["type"] = new_node["type"].upper()
+        return new_node
+    elif isinstance(schema_node, list):
+        return [_make_schema_gapic_compatible(item) for item in schema_node]
+    else:
+        return schema_node
+
+
+def _patch_vertexai_for_gemini_ref():
+    """
+    Applies the definitive monkey-patch to langchain_google_vertexai to enable
+    native $ref support in Gemini. It replaces the `_dict_to_gapic_schema`
+    function with a version that correctly formats the schema without
+    dereferencing it.
+    """
+    from langchain_google_vertexai import functions_utils
+    from google.cloud.aiplatform_v1beta1.types import Schema
+
+    # Check if already patched to prevent re-patching
+    if hasattr(functions_utils, "original_dict_to_gapic_schema"):
+        logger.info("`_dict_to_gapic_schema` is already patched.")
+        return
+
+    functions_utils.original_dict_to_gapic_schema = (
+        functions_utils._dict_to_gapic_schema
+    )
+
+    def _patched_dict_to_gapic_schema(schema: Dict[str, Any], **kwargs) -> "Schema":
+        """
+        Patched function that intercepts the schema dictionary, applies all necessary
+        compatibility transformations, and converts it to a GAPIC Schema object
+        without dereferencing.
+        """
+        logger.warning("--- Running Patched _dict_to_gapic_schema from trustcall ---")
+        compatible_schema = _make_schema_gapic_compatible(schema)
+        schema_as_json_string = json.dumps(compatible_schema)
+        return Schema.from_json(schema_as_json_string)
+
+    functions_utils._dict_to_gapic_schema = _patched_dict_to_gapic_schema
+    logger.warning(
+        "Patched `langchain_google_vertexai.functions_utils._dict_to_gapic_schema`."
+    )

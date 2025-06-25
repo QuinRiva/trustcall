@@ -34,7 +34,9 @@ from pydantic import (
     field_validator,
 )
 
-from trustcall.utils import _exclude_none
+from trustcall.utils import (
+    _exclude_none,
+)
 
 logger = logging.getLogger("extraction")
 # Default depth for inlining recursive schema definitions for Gemini.
@@ -42,176 +44,83 @@ logger = logging.getLogger("extraction")
 DEFAULT_GEMINI_SCHEMA_GEN_DEPTH = 5 # Increased default depth
 
 
-def get_canonical_def_name(
-    def_name: str,
-    definitions: Dict[str, Any],
-    model_title: Optional[str] = None
-) -> str:
-    if def_name in definitions and definitions[def_name].get("properties"):
-        return def_name
-
-    base_name_match = re.match(r"(.+)(__\d+)$", def_name)
-    base_name_from_suffix = base_name_match.group(1) if base_name_match else def_name
-
-    possible_base_names = {base_name_from_suffix}
-    if model_title:
-        possible_base_names.add(model_title)
-        if "__" in base_name_from_suffix: 
-            fqn_prefix_parts = base_name_from_suffix.split('__')
-            if len(fqn_prefix_parts) > 1:
-                reconstructed_fqn_base = "__".join(fqn_prefix_parts[:-1]) 
-                possible_base_names.add(f"{reconstructed_fqn_base}__{model_title}")
-
-    best_candidate = def_name
-    best_candidate_is_complete = bool(definitions.get(def_name, {}).get("properties"))
-
-    for p_base_name in possible_base_names:
-        candidates_to_check = [p_base_name] + [f"{p_base_name}__{i}" for i in range(1, 4)] 
-
-        for candidate_name in candidates_to_check:
-            if candidate_name in definitions:
-                candidate_is_complete = bool(definitions[candidate_name].get("properties"))
-                
-                if candidate_is_complete:
-                    if not best_candidate_is_complete:
-                        best_candidate = candidate_name
-                        best_candidate_is_complete = True
-                    elif len(candidate_name) < len(best_candidate):
-                        best_candidate = candidate_name
-                elif not best_candidate_is_complete and candidate_name == p_base_name:
-                    best_candidate = candidate_name 
-
-    return best_candidate
+def _get_schema_for_intelligent_strategy(model: Type[BaseModel]) -> dict:
+    """
+    Generates a standard JSON schema for the 'intelligent' strategy.
+    The downstream monkey-patched langchain-google-vertexai library will
+    handle the conversion to a GAPIC-compatible format while preserving refs.
+    """
+    logger.warning(
+        f"Generating standard JSON schema for model '{model.__name__}' "
+        "for the 'intelligent' strategy."
+    )
+    # We return the standard schema. The patch prevents dereferencing.
+    return model.model_json_schema()
 
 
-def _transform_schema_for_gemini_recursive(
-    schema_node: Dict[str, Any],
-    all_definitions: Dict[str, Any],
-    current_depth: int,
-    max_inlining_depth: int,
-    visited_refs: Optional[Set[str]] = None 
-) -> Dict[str, Any]:
-
-    visited_refs = visited_refs or set() 
-
-    if "$ref" in schema_node:
-        ref_path = schema_node["$ref"]
-        original_def_name = ref_path.split('/')[-1]
-
-        model_title_for_lookup = schema_node.get("title")
-        if not model_title_for_lookup and original_def_name in all_definitions:
-            model_title_for_lookup = all_definitions[original_def_name].get("title")
-        
-        canonical_def_name = get_canonical_def_name(original_def_name, all_definitions, model_title_for_lookup)
-
-        if current_depth > max_inlining_depth: # Removed "or canonical_def_name in visited_refs"
-            stub_title = schema_node.get("title", all_definitions.get(canonical_def_name, {}).get("title", canonical_def_name))
-            reason = "Depth limit" # Simplified reason, as cycle check is removed from this condition
-            desc = f"Recursive definition of {stub_title} ({reason} for '{canonical_def_name}' at depth {current_depth})."
-            return {"type": "OBJECT", "title": stub_title, "description": desc, "properties": {}}
-
-        if canonical_def_name in all_definitions:
-            definition_to_inline = all_definitions[canonical_def_name]
-            new_visited_refs = visited_refs | {canonical_def_name}
-            transformed_definition = _transform_schema_for_gemini_recursive(
-                definition_to_inline, all_definitions, current_depth + 1, max_inlining_depth, new_visited_refs 
-            )
-            
-            if schema_node.get("title") and (not transformed_definition.get("title") or transformed_definition.get("title") == canonical_def_name):
-                transformed_definition["title"] = schema_node.get("title")
-            if schema_node.get("description") and not transformed_definition.get("description"):
-                 transformed_definition["description"] = schema_node.get("description")
-            return transformed_definition
-        else:
-            logger.warning(f"Unresolved $ref: {ref_path} (canonical: {canonical_def_name}) not found in definitions.")
-            return {"type": "OBJECT", "description": f"Unresolved reference: {ref_path}"}
-
-    transformed_node = {}
-    schema_type = schema_node.get("type")
-
-    type_map = {
-        "object": "OBJECT", "array": "ARRAY", "string": "STRING",
-        "integer": "INTEGER", "number": "NUMBER", "boolean": "BOOLEAN", "null": "NULL"
-    }
-
-    if isinstance(schema_type, str) and schema_type in type_map:
-        transformed_node["type"] = type_map[schema_type]
-    elif isinstance(schema_type, list):
-        gemini_types = [type_map[t] for t in schema_type if t in type_map]
-        if gemini_types:
-            primary_type = next((gt for gt in gemini_types if gt != "NULL"), gemini_types[0] if gemini_types else "OBJECT")
-            transformed_node["type"] = primary_type
-            if "NULL" in gemini_types and primary_type != "NULL":
-                transformed_node["nullable"] = True
-        else:
-            transformed_node["type"] = "OBJECT"
-            logger.warning(f"Unsupported types in list: {schema_type}, defaulting to OBJECT.")
-    elif "anyOf" in schema_node:
-        is_nullable = any(t.get("type") == "null" for t in schema_node["anyOf"])
-        first_concrete_type_schema = next((t for t in schema_node["anyOf"] if t.get("type") != "null"), None)
-        if first_concrete_type_schema:
-            transformed_first_type = _transform_schema_for_gemini_recursive(
-                first_concrete_type_schema, all_definitions, current_depth, max_inlining_depth, None # Pass None for visited_refs
-            )
-            transformed_node.update(transformed_first_type)
-        else:
-            transformed_node["type"] = "OBJECT"
-            logger.warning(f"No concrete type found in anyOf, defaulting to OBJECT. anyOf: {schema_node['anyOf']}")
-        if is_nullable:
-            transformed_node["nullable"] = True
-    elif not schema_type and "properties" in schema_node:
-         transformed_node["type"] = "OBJECT"
-    elif not schema_type and "items" in schema_node:
-         transformed_node["type"] = "ARRAY"
-    elif not schema_type:
-        logger.warning(f"Node has no type and is not identifiable as object/array, defaulting to OBJECT. Node: {schema_node}")
-        transformed_node["type"] = "OBJECT"
-
-    for key in ["title", "description", "enum", "format", "nullable", "default"]:
-        if key in schema_node:
-            transformed_node[key] = schema_node[key]
-
-    if transformed_node.get("type") == "OBJECT":
-        if "properties" in schema_node:
-            transformed_node["properties"] = {
-                k: _transform_schema_for_gemini_recursive(v, all_definitions, current_depth, max_inlining_depth, None) # Pass None for visited_refs
-                for k, v in schema_node["properties"].items()
-            }
-        if "required" in schema_node:
-            transformed_node["required"] = schema_node["required"]
-
-    elif transformed_node.get("type") == "ARRAY":
-        if "items" in schema_node:
-            transformed_items_schema = _transform_schema_for_gemini_recursive(
-                schema_node["items"], all_definitions, current_depth, max_inlining_depth, visited_refs
-            )
-            transformed_node["items"] = transformed_items_schema
-            
-    return _exclude_none(transformed_node)
-
-
-def _create_gemini_schema_with_inlining(pydantic_model: Type[BaseModel], max_depth: int) -> Dict[str, Any]:
-    standard_schema = pydantic_model.model_json_schema()
-    all_definitions = standard_schema.pop('$defs', standard_schema.pop('definitions', {}))
-    
-    transformed_root = _transform_schema_for_gemini_recursive(standard_schema, all_definitions, 0, max_depth, None)
-    
-    if "required" in standard_schema and "required" not in transformed_root and transformed_root.get("type") != "OBJECT":
-        transformed_root["required"] = standard_schema["required"]
-
-    return _exclude_none(transformed_root)
-
-
-def _get_schema(model: Type[BaseModel], for_gemini: bool, gemini_recursion_depth: Optional[int] = None) -> dict:
-    if for_gemini:
-        actual_depth = gemini_recursion_depth if gemini_recursion_depth is not None else DEFAULT_GEMINI_SCHEMA_GEN_DEPTH
-        return _create_gemini_schema_with_inlining(model, actual_depth)
+def _get_schema(
+    model: Type[BaseModel],
+    for_gemini: bool,
+    gemini_ref_strategy: Literal["inline", "intelligent"] = "inline",
+) -> dict:
+    logger.warning(f"_get_schema: Called for model '{model.__name__}' with for_gemini={for_gemini}, strategy='{gemini_ref_strategy}'")
+    if for_gemini and gemini_ref_strategy == "intelligent":
+        return _get_schema_for_intelligent_strategy(model)
+    elif for_gemini:
+        # Fallback to original, safe inlining logic for the 'inline' strategy
+        return _create_gemini_schema_with_inlining(
+            model, DEFAULT_GEMINI_SCHEMA_GEN_DEPTH
+        )
     else:
         if hasattr(model, "model_json_schema"):
             schema = model.model_json_schema()
         else:
             schema = model.schema()  # type: ignore
         return _exclude_none(schema)
+
+
+def _create_gemini_schema_with_inlining(
+    pydantic_model: Type[BaseModel], max_depth: int
+) -> Dict[str, Any]:
+    """
+    This function is a fallback for the 'inline' strategy.
+    It recursively inlines all definitions up to a certain depth.
+    """
+    standard_schema = pydantic_model.model_json_schema()
+    all_definitions = standard_schema.pop(
+        "$defs", standard_schema.pop("definitions", {})
+    )
+
+    def _recursive_inline(schema_node: Any, current_depth: int) -> Any:
+        if isinstance(schema_node, dict):
+            if "$ref" in schema_node:
+                if current_depth > max_depth:
+                    return {"type": "OBJECT", "description": "Max depth reached"}
+                ref_name = schema_node["$ref"].split("/")[-1]
+                if ref_name in all_definitions:
+                    return _recursive_inline(
+                        all_definitions[ref_name], current_depth + 1
+                    )
+                else:
+                    return {
+                        "type": "OBJECT",
+                        "description": f"Unresolved reference: {ref_name}",
+                    }
+
+            new_dict = {}
+            for key, value in schema_node.items():
+                new_key = key
+                new_value = value
+                if key == "type" and isinstance(value, str):
+                    new_value = value.upper()
+                new_dict[new_key] = _recursive_inline(new_value, current_depth)
+            return new_dict
+        elif isinstance(schema_node, list):
+            return [_recursive_inline(item, current_depth) for item in schema_node]
+        else:
+            return schema_node
+
+    return _recursive_inline(standard_schema, 0)
 
 
 # JSON Patch related classes
@@ -481,7 +390,7 @@ def _ensure_patches(args: dict) -> list[Dict[str, Any]]:
                                         evaluated_value = ast.literal_eval(stripped_value)
                                         if isinstance(evaluated_value, (dict, list)):
                                             parsed_value = evaluated_value
-                                            logger.debug(f"Successfully parsed patch value string using ast.literal_eval: {stripped_value[:100]}...")
+                                            logger.info(f"Successfully parsed patch value string using ast.literal_eval: {stripped_value[:100]}...")
                                         else:
                                             logger.warning(f"ast.literal_eval parsed patch value string but not to dict/list: {stripped_value[:100]}... Type: {type(evaluated_value)}")
                                     except (ValueError, SyntaxError, TypeError) as ast_e:

@@ -507,23 +507,24 @@ The `create_extractor` function offers additional parameters to fine-tune its be
 
 #### Controlling Schema Generation for Gemini Models
 
-When using Gemini models, `trustcall` internally transforms Pydantic schemas to be more compatible with Gemini's function calling requirements. This often involves inlining nested or recursive model definitions.
+When using Gemini models, `trustcall` internally transforms Pydantic schemas to be more compatible with Google's API client library. This involves a choice between two strategies for handling nested or recursive model definitions.
 
-*   **`gemini_schema_recursion_depth`** (Optional[int]):
-    *   This parameter, passed to `create_extractor`, controls how many levels deep recursive schema definitions (like a model that refers to itself or other models that refer back to it) are inlined when generating the schema specifically for a Gemini LLM.
-    *   **Purpose:** Gemini does not support `$ref` structures in JSON schemas. Inlining these references up to a certain depth can improve reliability.
-    *   **Default:** If not provided, it defaults to `5` (as defined by `DEFAULT_GEMINI_SCHEMA_GEN_DEPTH` in `trustcall.schema`).
+*   **`gemini_ref_strategy`** (Literal["inline", "intelligent"], default="inline"):
+    *   This parameter controls how `trustcall` handles nested Pydantic models when generating the schema for a Gemini LLM.
+    *   **`"inline"` (Default)**: This is the safest strategy. It flattens the entire schema, replacing all references (`$ref`) with the full definition of the nested model. This guarantees that all contextual information (like field-specific descriptions) is preserved, which is crucial for complex models where a class might be used in different contexts (e.g., a `User` model for both a `sender` and a `recipient`).
+    *   **`"intelligent"`**: This advanced strategy attempts to preserve schema references (`$ref`) for more efficient processing, but it comes with a trade-off. It will use references for simple, non-ambiguous cases (like singleton classes used only once). However, for classes used in multiple contexts with different descriptions, it will fall back to inlining to avoid losing the context-specific descriptions that are critical for the LLM's accuracy. This can result in smaller schemas but requires careful model design to avoid ambiguity.
     *   **Usage:**
         ```python
         from trustcall import create_extractor
         from langchain_google_vertexai import ChatVertexAI # Or any Gemini model
 
         llm = ChatVertexAI(model_name="gemini-1.5-flash-001")
-        # Example: Limit inlining to 3 levels for Gemini
+        
+        # Use the intelligent strategy for potentially smaller schemas
         extractor = create_extractor(
             llm,
             tools=[YourPydanticModel],
-            gemini_schema_recursion_depth=3
+            gemini_ref_strategy="intelligent"
         )
         ```
 
