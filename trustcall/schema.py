@@ -39,88 +39,23 @@ from trustcall.utils import (
 )
 
 logger = logging.getLogger("extraction")
-# Default depth for inlining recursive schema definitions for Gemini.
-# This value is used if no specific depth is provided by the caller.
-DEFAULT_GEMINI_SCHEMA_GEN_DEPTH = 5 # Increased default depth
-
-
-def _get_schema_for_intelligent_strategy(model: Type[BaseModel]) -> dict:
-    """
-    Generates a standard JSON schema for the 'intelligent' strategy.
-    The downstream monkey-patched langchain-google-vertexai library will
-    handle the conversion to a GAPIC-compatible format while preserving refs.
-    """
-    logger.warning(
-        f"Generating standard JSON schema for model '{model.__name__}' "
-        "for the 'intelligent' strategy."
-    )
-    # We return the standard schema. The patch prevents dereferencing.
-    return model.model_json_schema()
-
-
 def _get_schema(
     model: Type[BaseModel],
     for_gemini: bool,
     gemini_ref_strategy: Literal["inline", "intelligent"] = "inline",
 ) -> dict:
-    logger.warning(f"_get_schema: Called for model '{model.__name__}' with for_gemini={for_gemini}, strategy='{gemini_ref_strategy}'")
-    if for_gemini and gemini_ref_strategy == "intelligent":
-        return _get_schema_for_intelligent_strategy(model)
-    elif for_gemini:
-        # Fallback to original, safe inlining logic for the 'inline' strategy
-        return _create_gemini_schema_with_inlining(
-            model, DEFAULT_GEMINI_SCHEMA_GEN_DEPTH
-        )
-    else:
-        if hasattr(model, "model_json_schema"):
-            schema = model.model_json_schema()
-        else:
-            schema = model.schema()  # type: ignore
-        return _exclude_none(schema)
-
-
-def _create_gemini_schema_with_inlining(
-    pydantic_model: Type[BaseModel], max_depth: int
-) -> Dict[str, Any]:
     """
-    This function is a fallback for the 'inline' strategy.
-    It recursively inlines all definitions up to a certain depth.
+    Gets the JSON schema for a Pydantic model.
+
+    For all cases, this function now simply returns the standard Pydantic
+    JSON schema. The downstream monkey-patch in `utils.py` is responsible
+    for all necessary transformations (dereferencing for 'inline' and
+    GAPIC-compatibility formatting for all strategies).
     """
-    standard_schema = pydantic_model.model_json_schema()
-    all_definitions = standard_schema.pop(
-        "$defs", standard_schema.pop("definitions", {})
+    logger.warning(
+        f"Generating standard JSON schema for model '{model.__name__}'."
     )
-
-    def _recursive_inline(schema_node: Any, current_depth: int) -> Any:
-        if isinstance(schema_node, dict):
-            if "$ref" in schema_node:
-                if current_depth > max_depth:
-                    return {"type": "OBJECT", "description": "Max depth reached"}
-                ref_name = schema_node["$ref"].split("/")[-1]
-                if ref_name in all_definitions:
-                    return _recursive_inline(
-                        all_definitions[ref_name], current_depth + 1
-                    )
-                else:
-                    return {
-                        "type": "OBJECT",
-                        "description": f"Unresolved reference: {ref_name}",
-                    }
-
-            new_dict = {}
-            for key, value in schema_node.items():
-                new_key = key
-                new_value = value
-                if key == "type" and isinstance(value, str):
-                    new_value = value.upper()
-                new_dict[new_key] = _recursive_inline(new_value, current_depth)
-            return new_dict
-        elif isinstance(schema_node, list):
-            return [_recursive_inline(item, current_depth) for item in schema_node]
-        else:
-            return schema_node
-
-    return _recursive_inline(standard_schema, 0)
+    return model.model_json_schema()
 
 
 # JSON Patch related classes

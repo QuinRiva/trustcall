@@ -202,11 +202,25 @@ def _patch_vertexai_for_gemini_ref():
     def _patched_dict_to_gapic_schema(schema: Dict[str, Any], **kwargs) -> "Schema":
         """
         Patched function that intercepts the schema dictionary, applies all necessary
-        compatibility transformations, and converts it to a GAPIC Schema object
-        without dereferencing.
+        compatibility transformations, and converts it to a GAPIC Schema object.
+
+        This single patch handles both 'intelligent' and 'inline' strategies.
         """
         logger.warning("--- Running Patched _dict_to_gapic_schema from trustcall ---")
-        compatible_schema = _make_schema_gapic_compatible(schema)
+
+        # For the 'inline' strategy, we must first dereference the schema.
+        # We detect this by checking for the absence of '$defs'.
+        if "$defs" not in schema:
+            logger.warning("No $defs found, assuming 'inline' strategy. Dereferencing.")
+            from langchain_core.utils.json_schema import dereference_refs
+            schema_to_format = dereference_refs(schema)
+        else:
+            # For the 'intelligent' strategy, we format the schema with refs intact.
+            logger.warning("Found $defs, assuming 'intelligent' strategy.")
+            schema_to_format = schema
+
+        # Apply the robust formatting to the chosen schema.
+        compatible_schema = _make_schema_gapic_compatible(schema_to_format)
         schema_as_json_string = json.dumps(compatible_schema)
         return Schema.from_json(schema_as_json_string)
 
