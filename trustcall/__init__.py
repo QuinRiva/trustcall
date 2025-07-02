@@ -6,6 +6,9 @@ patch-based extraction for efficient and accurate updates to existing schemas.
 """
 
 from trustcall._base import ExtractionInputs, ExtractionOutputs, create_extractor
+from trustcall.utils import _patch_vertexai_for_gemini_ref
+
+_patch_vertexai_for_gemini_ref()
 
 __all__ = [
     "create_extractor",

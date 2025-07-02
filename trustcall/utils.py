@@ -14,6 +14,7 @@ from typing import (
     Set,
     Type,
     get_args,
+    Optional
 )
 
 import google.cloud.aiplatform_v1beta1.types as gapic
@@ -151,9 +152,9 @@ def _make_schema_gapic_compatible(schema_node: Any) -> Any:
         new_node = schema_node.copy()
 
         if "$ref" in new_node:
-            ref_val = new_node["$ref"]
-            # Gemini expects just the definition name, e.g., "Address"
-            return {"ref": ref_val.split('/')[-1]}
+            ref_val = new_node.pop("$ref")
+            # The API expects the reference to be a JSON pointer to the defs section.
+            new_node["ref"] = f"#/defs/{ref_val.split('/')[-1]}"
 
         if "$defs" in new_node:
             new_node["defs"] = new_node.pop("$defs")
@@ -165,6 +166,7 @@ def _make_schema_gapic_compatible(schema_node: Any) -> Any:
             new_node["type"] = new_node["type"].upper()
 
         if "anyOf" in new_node:
+            # Handle Optional[T] types
             non_null_schema = next(
                 (item for item in new_node["anyOf"] if item.get("type") != "NULL"), None
             )
@@ -192,7 +194,6 @@ def _patch_vertexai_for_gemini_ref():
 
     # Check if already patched to prevent re-patching
     if hasattr(functions_utils, "original_dict_to_gapic_schema"):
-        logger.info("`_dict_to_gapic_schema` is already patched.")
         return
 
     functions_utils.original_dict_to_gapic_schema = (
@@ -203,28 +204,20 @@ def _patch_vertexai_for_gemini_ref():
         """
         Patched function that intercepts the schema dictionary, applies all necessary
         compatibility transformations, and converts it to a GAPIC Schema object.
-
-        This single patch handles both 'intelligent' and 'inline' strategies.
+        This allows native $ref support in Gemini.
         """
-        logger.warning("--- Running Patched _dict_to_gapic_schema from trustcall ---")
-
-        # For the 'inline' strategy, we must first dereference the schema.
-        # We detect this by checking for the absence of '$defs'.
+        # The 'intelligent' strategy requires refs to be preserved.
+        # The 'inline' strategy requires them to be dereferenced first.
         if "$defs" not in schema:
-            logger.warning("No $defs found, assuming 'inline' strategy. Dereferencing.")
             from langchain_core.utils.json_schema import dereference_refs
             schema_to_format = dereference_refs(schema)
         else:
             # For the 'intelligent' strategy, we format the schema with refs intact.
-            logger.warning("Found $defs, assuming 'intelligent' strategy.")
             schema_to_format = schema
 
-        # Apply the robust formatting to the chosen schema.
         compatible_schema = _make_schema_gapic_compatible(schema_to_format)
+
         schema_as_json_string = json.dumps(compatible_schema)
         return Schema.from_json(schema_as_json_string)
 
     functions_utils._dict_to_gapic_schema = _patched_dict_to_gapic_schema
-    logger.warning(
-        "Patched `langchain_google_vertexai.functions_utils._dict_to_gapic_schema`."
-    )

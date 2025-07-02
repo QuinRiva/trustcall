@@ -76,19 +76,36 @@ class _Extract:
         tool_choice: Optional[str] = None,
         for_gemini: bool = False,
         gemini_ref_strategy: Literal["inline", "intelligent"] = "inline",
+        gemini_schema_recursion_depth: Optional[int] = None,
     ):
         self.llm = llm
+        tools_to_bind = []
+        if for_gemini:
+            if gemini_ref_strategy == "intelligent":
+                _patch_vertexai_for_gemini_ref()
+            
+            for tool in tools:
+                if isinstance(tool, type) and issubclass(tool, BaseModel):
+                    schema = _get_schema(
+                        tool,
+                        for_gemini=True,
+                        gemini_ref_strategy=gemini_ref_strategy,
+                        gemini_schema_recursion_depth=gemini_schema_recursion_depth,
+                    )
+                    tools_to_bind.append({
+                        "type": "function",
+                        "function": {
+                            "name": schema.get("title", tool.__name__),
+                            "description": schema.get("description", tool.__doc__ or ""),
+                            "parameters": schema,
+                        },
+                    })
+                else:
+                    tools_to_bind.append(tool)
+        else:
+            tools_to_bind = list(tools)
 
-        logger.warning(f"_Extract.__init__: Initializing with for_gemini={for_gemini}, gemini_ref_strategy='{gemini_ref_strategy}'")
-        # If using the intelligent strategy, apply the monkey-patch.
-        if for_gemini and gemini_ref_strategy == "intelligent":
-            _patch_vertexai_for_gemini_ref()
-
-        # By passing the Pydantic models (in `tools`) directly to `bind_tools`,
-        # we ensure our patched `_dict_to_gapic_schema` is called,
-        # which correctly handles the 'intelligent' ref strategy.
-        logger.warning(f"_Extract.__init__: Binding tools with tool_choice='{tool_choice}'")
-        self.bound_llm = llm.bind_tools(tools, tool_choice=tool_choice)
+        self.bound_llm = llm.bind_tools(tools_to_bind, tool_choice=tool_choice)
 
     @ls.traceable
     def _tear_down(self, msg: AIMessage) -> dict:
@@ -103,7 +120,6 @@ class _Extract:
     async def ainvoke(self, state: ExtractionState, config: RunnableConfig) -> dict:
         """Extract entities from the input messages."""
         msg = await self.bound_llm.ainvoke(state.messages, config)
-        logger.warning(f"GEMINI RAW OUTPUT: {msg}")
         return self._tear_down(cast(AIMessage, msg))
 
     def invoke(self, state: ExtractionState, config: RunnableConfig) -> dict:
@@ -135,8 +151,10 @@ class _ExtractUpdates:
         enable_deletes: bool = False,
         existing_schema_policy: bool | Literal["ignore"] = True,
         gemini_ref_strategy: Literal["inline", "intelligent"] = "inline",
+        gemini_schema_recursion_depth: Optional[int] = None,
     ):
         self.gemini_ref_strategy = gemini_ref_strategy
+        self.gemini_schema_recursion_depth = gemini_schema_recursion_depth
         if not any((enable_inserts, enable_updates, enable_deletes)):
             raise ValueError(
                 "At least one of enable_inserts, enable_updates,"
@@ -188,6 +206,7 @@ class _ExtractUpdates:
                         schema,
                         self.using_gemini,
                         gemini_ref_strategy=self.gemini_ref_strategy,
+                        gemini_schema_recursion_depth=self.gemini_schema_recursion_depth,
                     )
                     schema_str = f"""
     <json_schema>
@@ -538,8 +557,8 @@ def create_extractor(
     enable_deletes: bool = False,
     existing_schema_policy: bool | Literal["ignore"] = True,
     gemini_ref_strategy: Literal["inline", "intelligent"] = "inline",
+    gemini_schema_recursion_depth: Optional[int] = None,
 ) -> Runnable[InputsLike, ExtractionOutputs]:
-    logger.warning(f"create_extractor: Called with gemini_ref_strategy='{gemini_ref_strategy}'")
     """Create an extractor that generates validated structured outputs using an LLM.
 
     This function binds validators and retry logic to ensure the validity of
@@ -566,6 +585,10 @@ def create_extractor(
             "ignore" means ignore (drop any attempts to patch these)
         gemini_ref_strategy (Literal["inline", "intelligent"]): The strategy to use
             for handling schema references in Gemini models. (default: "inline")
+
+        gemini_schema_recursion_depth (Optional[int]): The maximum recursion depth
+            for inlining schema definitions when using the 'inline' strategy with
+            Gemini models. (default: 5)
 
     Returns:
         Runnable[ExtractionInputs, ExtractionOutputs]: A runnable that
@@ -700,12 +723,15 @@ def create_extractor(
     # Check if the model is a Gemini model - this affects the schema generation and patching
     using_gemini = is_gemini_model(llm)
 
+    if using_gemini and gemini_ref_strategy == "intelligent":
+        _patch_vertexai_for_gemini_ref()
+
     # Define error formatting
     def format_exception(error: BaseException, call: ToolCall, schema: Type[BaseModel]) -> str:
         return (
             f"Error:\n\n```\n{str(error)}\n```\n"
             "Expected Parameter Schema:\n\n"
-            + f"```json\n{_get_schema(schema, using_gemini, gemini_ref_strategy=gemini_ref_strategy)}\n```\n"
+            + f"```json\n{_get_schema(schema, using_gemini, gemini_ref_strategy=gemini_ref_strategy, gemini_schema_recursion_depth=gemini_schema_recursion_depth)}\n```\n"
             f"Please use PatchFunctionErrors to fix all validation errors."
             f" for json_doc_id=[{call['id']}]."
         )
@@ -727,8 +753,6 @@ def create_extractor(
     ]
     tool_names = [getattr(t, "name", t.__name__) for t in _extract_tools]
 
-    # The patch is now applied within the _Extract class constructor,
-    # so no special handling is needed here.
     builder.add_node(
         _Extract(
             llm,
@@ -736,6 +760,7 @@ def create_extractor(
             tool_choice,
             for_gemini=using_gemini,
             gemini_ref_strategy=gemini_ref_strategy,
+            gemini_schema_recursion_depth=gemini_schema_recursion_depth,
         ).as_runnable()
     )
     updater = _ExtractUpdates(
@@ -746,6 +771,7 @@ def create_extractor(
         enable_deletes=enable_deletes,  # type: ignore
         existing_schema_policy=existing_schema_policy,
         gemini_ref_strategy=gemini_ref_strategy,
+        gemini_schema_recursion_depth=gemini_schema_recursion_depth,
     )
     builder.add_node(updater.as_runnable())
     builder.add_node(_Patch(llm, valid_tool_names=tool_names).as_runnable())
@@ -880,20 +906,15 @@ def create_extractor(
         # This is the Gemini bypass path. The tool calls are in additional_kwargs
         # and need to be manually parsed and added to the message for tracing.
         if not msg.tool_calls and msg.additional_kwargs.get("function_call"):
-            logger.warning("Entered Gemini 'function_call' processing block.")
             raw_function_call = msg.additional_kwargs["function_call"]
             tool_name = raw_function_call.get("name")
-            logger.warning(f"Tool name from Gemini: {tool_name}")
             
             try:
                 # Arguments are returned as a string, so they must be loaded.
-                raw_args = raw_function_call.get("arguments", "{}")
-                logger.warning(f"Raw arguments string from Gemini: {raw_args}")
                 tool_args = json.loads(raw_function_call.get("arguments", "{}"))
                 
                 if tool_name in validator.schemas_by_name:
                     schema = validator.schemas_by_name[tool_name]
-                    logger.warning(f"Found schema for '{tool_name}'. Attempting validation.")
                     validated_data = schema.model_validate(tool_args)
                     responses.append(validated_data)
                     
@@ -903,17 +924,13 @@ def create_extractor(
                         name=tool_name, args=tool_args, id=tool_call_id
                     )
                     msg.tool_calls = [reconstructed_tool_call]
-                    logger.warning(f"SUCCESS: Reconstructed and assigned tool_call to message: {msg.tool_calls}")
                     response_metadata.append({"id": tool_call_id, "name": tool_name})
                 else:
-                    logger.error(f"Unrecognized tool call from Gemini: {tool_name}")
                     logger.warning(f"Unrecognized tool call from Gemini: {tool_name}")
 
             except (json.JSONDecodeError, TypeError) as e:
-                logger.error(f"FAILED to parse or validate Gemini tool call. Error: {e}", exc_info=True)
                 logger.error(f"Failed to parse or validate Gemini tool call: {e}")
             except Exception as e:
-                logger.error(f"An UNEXPECTED error occurred during Gemini response parsing. Error: {e}", exc_info=True)
                 logger.error(f"An unexpected error occurred during Gemini response parsing: {e}")
 
         # This is the standard path for most models, or for Gemini when not using the bypass.
