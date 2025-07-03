@@ -21,7 +21,7 @@ from typing import (
     Union,
     get_args,
     get_origin,
-    Set, 
+    Set,
 )
 
 from pydantic import (
@@ -40,6 +40,17 @@ from trustcall.utils import (
 
 logger = logging.getLogger("extraction")
 DEFAULT_GEMINI_SCHEMA_GEN_DEPTH = 5
+
+# Based on the error message from the Google API client.
+# Available Fields(except extensions): "['type', 'format', 'title', 'description', 'nullable', 'default', 'items', 'minItems', 'maxItems', 'enum', 'properties', 'propertyOrdering', 'required', 'minProperties', 'maxProperties', 'minimum', 'maximum', 'minLength', 'maxLength', 'pattern', 'example', 'anyOf', 'additionalProperties', 'ref', 'defs']"
+GEMINI_SUPPORTED_FIELDS = {
+    'type', 'format', 'title', 'description', 'nullable', 'default', 'items',
+    'minItems', 'maxItems', 'enum', 'properties', 'propertyOrdering', 'required',
+    'minProperties', 'maxProperties', 'minimum', 'maximum', 'minLength',
+    'maxLength', 'pattern', 'example', 'anyOf', 'additionalProperties',
+    # Not including $ref and $defs as this function handles inlining
+}
+
 
 def get_canonical_def_name(
     def_name: str,
@@ -88,109 +99,75 @@ def _transform_schema_for_gemini_recursive(
     all_definitions: Dict[str, Any],
     current_depth: int,
     max_inlining_depth: int,
-    visited_refs: Optional[Set[str]] = None 
+    visited_refs: Optional[Set[str]] = None
 ) -> Dict[str, Any]:
+    """
+    Recursively traverses a JSON schema, inlining references and stripping
+    unsupported fields to make it compatible with the Google AI Platform
+    GAPIC client library for Gemini.
+    """
+    visited_refs = visited_refs or set()
 
-    visited_refs = visited_refs or set() 
-
+    # 1. Handle $ref inlining first.
     if "$ref" in schema_node:
         ref_path = schema_node["$ref"]
         original_def_name = ref_path.split('/')[-1]
-
-        model_title_for_lookup = schema_node.get("title")
-        if not model_title_for_lookup and original_def_name in all_definitions:
-            model_title_for_lookup = all_definitions[original_def_name].get("title")
-        
-        canonical_def_name = get_canonical_def_name(original_def_name, all_definitions, model_title_for_lookup)
+        canonical_def_name = get_canonical_def_name(original_def_name, all_definitions)
 
         if current_depth > max_inlining_depth:
-            stub_title = schema_node.get("title", all_definitions.get(canonical_def_name, {}).get("title", canonical_def_name))
-            reason = "Depth limit"
-            desc = f"Recursive definition of {stub_title} ({reason} for '{canonical_def_name}' at depth {current_depth})."
-            return {"type": "OBJECT", "title": stub_title, "description": desc, "properties": {}}
+            return {"type": "OBJECT", "description": f"Recursive definition of {canonical_def_name} omitted."}
 
         if canonical_def_name in all_definitions:
             definition_to_inline = all_definitions[canonical_def_name]
             new_visited_refs = visited_refs | {canonical_def_name}
-            transformed_definition = _transform_schema_for_gemini_recursive(
-                definition_to_inline, all_definitions, current_depth + 1, max_inlining_depth, new_visited_refs 
+            return _transform_schema_for_gemini_recursive(
+                definition_to_inline, all_definitions, current_depth + 1, max_inlining_depth, new_visited_refs
             )
-            
-            if schema_node.get("title") and (not transformed_definition.get("title") or transformed_definition.get("title") == canonical_def_name):
-                transformed_definition["title"] = schema_node.get("title")
-            if schema_node.get("description") and not transformed_definition.get("description"):
-                 transformed_definition["description"] = schema_node.get("description")
-            return transformed_definition
         else:
-            logger.warning(f"Unresolved $ref: {ref_path} (canonical: {canonical_def_name}) not found in definitions.")
             return {"type": "OBJECT", "description": f"Unresolved reference: {ref_path}"}
 
-    transformed_node = {}
-    schema_type = schema_node.get("type")
+    # 2. For a concrete node (no $ref), transform it by filtering and recursing.
+    new_node = {}
+    for key, value in schema_node.items():
+        if key not in GEMINI_SUPPORTED_FIELDS:
+            continue
 
-    type_map = {
-        "object": "OBJECT", "array": "ARRAY", "string": "STRING",
-        "integer": "INTEGER", "number": "NUMBER", "boolean": "BOOLEAN", "null": "NULL"
-    }
-
-    if isinstance(schema_type, str) and schema_type in type_map:
-        transformed_node["type"] = type_map[schema_type]
-    elif isinstance(schema_type, list):
-        gemini_types = [type_map[t] for t in schema_type if t in type_map]
-        if gemini_types:
-            primary_type = next((gt for gt in gemini_types if gt != "NULL"), gemini_types[0] if gemini_types else "OBJECT")
-            transformed_node["type"] = primary_type
-            if "NULL" in gemini_types and primary_type != "NULL":
-                transformed_node["nullable"] = True
-        else:
-            transformed_node["type"] = "OBJECT"
-            logger.warning(f"Unsupported types in list: {schema_type}, defaulting to OBJECT.")
-    elif "anyOf" in schema_node:
-        is_nullable = any(t.get("type") == "null" for t in schema_node["anyOf"])
-        first_concrete_type_schema = next((t for t in schema_node["anyOf"] if t.get("type") != "null"), None)
-        if first_concrete_type_schema:
-            transformed_first_type = _transform_schema_for_gemini_recursive(
-                first_concrete_type_schema, all_definitions, current_depth, max_inlining_depth, None
-            )
-            transformed_node.update(transformed_first_type)
-        else:
-            transformed_node["type"] = "OBJECT"
-            logger.warning(f"No concrete type found in anyOf, defaulting to OBJECT. anyOf: {schema_node['anyOf']}")
-        if is_nullable:
-            transformed_node["nullable"] = True
-    elif not schema_type and "properties" in schema_node:
-         transformed_node["type"] = "OBJECT"
-    elif not schema_type and "items" in schema_node:
-         transformed_node["type"] = "ARRAY"
-    elif not schema_type:
-        logger.warning(f"Node has no type and is not identifiable as object/array, defaulting to OBJECT. Node: {schema_node}")
-        transformed_node["type"] = "OBJECT"
-
-    for key in ["title", "description", "enum", "format", "nullable", "default"]:
-        if key in schema_node:
-            transformed_node[key] = schema_node[key]
-
-    if transformed_node.get("type") == "OBJECT":
-        if "properties" in schema_node:
-            transformed_node["properties"] = {
-                k: _transform_schema_for_gemini_recursive(v, all_definitions, current_depth, max_inlining_depth, None)
-                for k, v in schema_node["properties"].items()
+        if key == 'properties':
+            # Special handling for properties: recurse on each property's schema (the value),
+            # but keep the property name (the key) as is.
+            new_node[key] = {
+                prop_name: _transform_schema_for_gemini_recursive(prop_schema, all_definitions, current_depth, max_inlining_depth, visited_refs)
+                for prop_name, prop_schema in value.items()
             }
-        if "required" in schema_node:
-            transformed_node["required"] = schema_node["required"]
+        elif isinstance(value, dict):
+            new_node[key] = _transform_schema_for_gemini_recursive(value, all_definitions, current_depth, max_inlining_depth, visited_refs)
+        elif isinstance(value, list) and key != 'enum':
+            new_node[key] = [
+                _transform_schema_for_gemini_recursive(item, all_definitions, current_depth, max_inlining_depth, visited_refs)
+                if isinstance(item, dict) else item
+                for item in value
+            ]
+        else:
+            new_node[key] = value
 
-    elif transformed_node.get("type") == "ARRAY":
-        if "items" in schema_node:
-            transformed_items_schema = _transform_schema_for_gemini_recursive(
-                schema_node["items"], all_definitions, current_depth, max_inlining_depth, visited_refs
-            )
-            transformed_node["items"] = transformed_items_schema
-            
-    return _exclude_none(transformed_node)
+    # 3. Handle type uppercasing and anyOf logic on the transformed node
+    if "type" in new_node and isinstance(new_node["type"], str):
+        new_node["type"] = new_node["type"].upper()
+
+    if "anyOf" in new_node:
+        is_nullable = any(t.get("type") == "NULL" for t in new_node.get("anyOf", []))
+        non_null_schema = next((item for item in new_node.get("anyOf", []) if item.get("type") != "NULL"), None)
+        
+        del new_node["anyOf"]
+        if non_null_schema:
+            new_node.update(non_null_schema)
+        if is_nullable:
+            new_node["nullable"] = True
+
+    return _exclude_none(new_node)
 
 
-def _create_gemini_schema_with_inlining(pydantic_model: Type[BaseModel], max_depth: int) -> Dict[str, Any]:
-    standard_schema = pydantic_model.model_json_schema()
+def _create_gemini_schema_with_inlining(standard_schema: Dict[str, Any], max_depth: int) -> Dict[str, Any]:
     all_definitions = standard_schema.pop('$defs', standard_schema.pop('definitions', {}))
     
     transformed_root = _transform_schema_for_gemini_recursive(standard_schema, all_definitions, 0, max_depth, None)
@@ -212,11 +189,13 @@ def _get_schema(
     """
     if for_gemini:
         if gemini_ref_strategy == "inline":
-            logger.warning("Generating schema with 'inline' strategy.")
+            standard_schema = model.model_json_schema()
             actual_depth = gemini_schema_recursion_depth if gemini_schema_recursion_depth is not None else DEFAULT_GEMINI_SCHEMA_GEN_DEPTH
-            return _create_gemini_schema_with_inlining(model, actual_depth)
+            transformed_schema = _create_gemini_schema_with_inlining(standard_schema, actual_depth)
+            return transformed_schema
         else:  # intelligent
-            return model.model_json_schema(ref_template="#/$defs/{model}")
+            schema = model.model_json_schema(ref_template="#/$defs/{model}")
+            return schema
     else:
         return model.model_json_schema()
 
@@ -288,53 +267,57 @@ class FullPatch(BasePatch):
         }
     )
 
-class GeminiJsonPatch(BasePatch):
-    """A JSON Patch document represents an operation to be performed on a JSON document.
-
-    Note that the op and path are ALWAYS required. Value is required for ALL operations except 'remove'.
-    This supports Gemini with it's more limited JSON compatibility.
-    """ # noqa
-    
-    value: Optional[str] = Field(
-        default=None,
-        description="The value to be used within the operation. For complex values (objects, arrays), "
-        "provide valid JSON as a string. Required for 'add' and 'replace' operations."
-    )
-    
-    @field_validator('value')
-    @classmethod
-    def validate_value(cls, v, info):
-        values = info.data
-        if v is None and values.get("op") == "remove":
-            return v
-        if isinstance(v, (dict, list)):
-            return json.dumps(v)
-        if v is not None and not isinstance(v, str):
-            return str(v)
-        return v
-    
-    model_config = ConfigDict(
-        json_schema_extra={
-            "type": "OBJECT",
-            "properties": {
-                "op": {
-                    "type": "STRING",
-                    "enum": ["add", "remove", "replace"],
-                    "description": "The operation to be performed."
-                },
-                "path": {
-                    "type": "STRING",
-                    "description": "JSON Pointer path where the operation is performed."
-                },
-                "value": {
-                    "type": "STRING",
-                    "description": "The value to be used within the operation. For complex values (objects, arrays), "
-                                   "provide valid JSON as a string. Required for 'add' and 'replace' operations."
-                }
-            },
-            "required": ["op", "path"]
-        }
-    )
+# It is hypothesized that Gemini's JSON mode has improved and the stringification
+# of complex values is no longer necessary. To test this, we are commenting out
+# the specialized GeminiJsonPatch and aliasing it to FullPatch.
+# class GeminiJsonPatch(BasePatch):
+#     """A JSON Patch document represents an operation to be performed on a JSON document.
+#
+#     Note that the op and path are ALWAYS required. Value is required for ALL operations except 'remove'.
+#     This supports Gemini with it's more limited JSON compatibility.
+#     """ # noqa
+#
+#     value: Optional[str] = Field(
+#         default=None,
+#         description="The value to be used within the operation. For complex values (objects, arrays), "
+#         "provide valid JSON as a string. Required for 'add' and 'replace' operations."
+#     )
+#
+#     @field_validator('value')
+#     @classmethod
+#     def validate_value(cls, v, info):
+#         values = info.data
+#         if v is None and values.get("op") == "remove":
+#             return v
+#         if isinstance(v, (dict, list)):
+#             return json.dumps(v)
+#         if v is not None and not isinstance(v, str):
+#             return str(v)
+#         return v
+#
+#     model_config = ConfigDict(
+#         json_schema_extra={
+#             "type": "OBJECT",
+#             "properties": {
+#                 "op": {
+#                     "type": "STRING",
+#                     "enum": ["add", "remove", "replace"],
+#                     "description": "The operation to be performed."
+#                 },
+#                 "path": {
+#                     "type": "STRING",
+#                     "description": "JSON Pointer path where the operation is performed."
+#                 },
+#                 "value": {
+#                     "type": "STRING",
+#                     "description": "The value to be used within the operation. For complex values (objects, arrays), "
+#                                    "provide valid JSON as a string. Required for 'add' and 'replace' operations."
+#                 }
+#             },
+#             "required": ["op", "path"]
+#         }
+#     )
+GeminiJsonPatch = FullPatch
 
 def get_patch_class(for_gemini: bool) -> Type[BasePatch]:
     return GeminiJsonPatch if for_gemini else FullPatch

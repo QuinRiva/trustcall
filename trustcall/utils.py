@@ -35,6 +35,13 @@ from pydantic import BaseModel, create_model as create_model_from_schema
 
 logger = logging.getLogger("extraction")
 
+GEMINI_SUPPORTED_FIELDS = {
+    'type', 'format', 'title', 'description', 'nullable', 'default', 'items',
+    'minItems', 'maxItems', 'enum', 'properties', 'propertyOrdering', 'required',
+    'minProperties', 'maxProperties', 'minimum', 'maximum', 'minLength',
+    'maxLength', 'pattern', 'example', 'anyOf', 'additionalProperties', '$ref', '$defs'
+}
+
 
 def is_gemini_model(llm: BaseChatModel) -> bool:
     """Determine if the provided LLM is a Google Vertex AI Gemini model."""
@@ -145,36 +152,51 @@ def _get_history_for_tool_call(messages: List[AnyMessage], tool_call_id: str):
 
 def _make_schema_gapic_compatible(schema_node: Any) -> Any:
     """
-    Recursively traverses a JSON schema and makes it compatible with the
-    Google AI Platform GAPIC client library.
+    Recursively traverses a JSON schema, stripping unsupported fields and
+    making it compatible with the Google AI Platform GAPIC client library.
     """
     if isinstance(schema_node, dict):
-        new_node = schema_node.copy()
+        new_node = {}
+        for key, value in schema_node.items():
+            new_key = key
+            # Handle key renaming for GAPIC compatibility
+            if key == '$ref':
+                new_key = 'ref'
+                value = f"#/defs/{value.split('/')[-1]}"
+            elif key == '$defs':
+                new_key = 'defs'
 
-        if "$ref" in new_node:
-            ref_val = new_node.pop("$ref")
-            # The API expects the reference to be a JSON pointer to the defs section.
-            new_node["ref"] = f"#/defs/{ref_val.split('/')[-1]}"
+            # Filter unsupported keys, but always allow 'properties'
+            if new_key not in GEMINI_SUPPORTED_FIELDS and new_key != 'properties':
+                continue
 
-        if "$defs" in new_node:
-            new_node["defs"] = new_node.pop("$defs")
+            # Recurse on nested structures
+            if new_key == 'properties':
+                new_node[new_key] = {
+                    prop_name: _make_schema_gapic_compatible(prop_schema)
+                    for prop_name, prop_schema in value.items()
+                }
+            elif isinstance(value, dict):
+                new_node[new_key] = _make_schema_gapic_compatible(value)
+            elif isinstance(value, list) and new_key != 'enum':
+                new_node[new_key] = [_make_schema_gapic_compatible(item) if isinstance(item, dict) else item for item in value]
+            else:
+                new_node[new_key] = value
 
-        for key, value in new_node.items():
-            new_node[key] = _make_schema_gapic_compatible(value)
-
+        # Handle type uppercasing and anyOf logic on the transformed node
         if "type" in new_node and isinstance(new_node["type"], str):
             new_node["type"] = new_node["type"].upper()
 
         if "anyOf" in new_node:
-            # Handle Optional[T] types
-            non_null_schema = next(
-                (item for item in new_node["anyOf"] if item.get("type") != "NULL"), None
-            )
+            is_nullable = any(t.get("type") == "NULL" for t in new_node.get("anyOf", []))
+            non_null_schema = next((item for item in new_node.get("anyOf", []) if item.get("type") != "NULL"), None)
+            
+            del new_node["anyOf"]
             if non_null_schema:
-                del new_node["anyOf"]
                 new_node.update(non_null_schema)
-                if "type" in new_node and isinstance(new_node["type"], str):
-                    new_node["type"] = new_node["type"].upper()
+            if is_nullable:
+                new_node["nullable"] = True
+        
         return new_node
     elif isinstance(schema_node, list):
         return [_make_schema_gapic_compatible(item) for item in schema_node]
@@ -214,9 +236,8 @@ def _patch_vertexai_for_gemini_ref():
         else:
             # For the 'intelligent' strategy, we format the schema with refs intact.
             schema_to_format = schema
-
+    
         compatible_schema = _make_schema_gapic_compatible(schema_to_format)
-
         schema_as_json_string = json.dumps(compatible_schema)
         return Schema.from_json(schema_as_json_string)
 
