@@ -34,7 +34,7 @@ from langchain_core.messages import (
 )
 from langchain_core.prompt_values import PromptValue
 from langchain_core.runnables import Runnable, RunnableConfig
-from langgraph.constants import Send
+from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.utils.runnable import RunnableCallable
 from pydantic import BaseModel
@@ -58,7 +58,6 @@ from trustcall.types import (
 )
 from trustcall.utils import (
     is_gemini_model,
-    _get_history_for_tool_call,
     _patch_vertexai_for_gemini_ref,
 )
 from trustcall.validation import _ExtendedValidationNode
@@ -344,6 +343,9 @@ class _ExtractUpdates:
         ai_message = AIMessage(
             content=msg.content,
             tool_calls=resolved_tool_calls,
+            id=msg.id,
+            usage_metadata=msg.usage_metadata,
+            response_metadata=msg.response_metadata,
             additional_kwargs={"updated_docs": updated_docs},
         )
         if not ai_message.id:
@@ -552,6 +554,7 @@ def create_extractor(
     *,
     tools: Sequence[TOOL_T],
     tool_choice: Optional[str] = None,
+    required_tools: Optional[List[str]] = None,
     enable_inserts: bool = False,
     enable_updates: bool = True,
     enable_deletes: bool = False,
@@ -573,6 +576,9 @@ def create_extractor(
         tool_choice (Optional[str]): The specific tool to use. If None,
             the LLM chooses whether to use (or not use) a tool based
             on the input messages. (default: None)
+        required_tools (Optional[List[str]]): A list of tool names that must be
+            included in the LLM response. If provided, a partial retry will be triggered
+            if the LLM does not include all required tools in its response.
         enable_inserts (bool): Whether to allow the LLM to extract new schemas
             even if it receives existing schemas. (default: False)
         enable_updates (bool): Whether to allow the LLM to update existing schemas
@@ -745,6 +751,7 @@ def create_extractor(
         ensure_tools(tools) + [patch_doc, patch_function_errors],
         format_error=format_exception,  # type: ignore
         enable_deletes=enable_deletes,
+        required_tools=required_tools,
     )
     _extract_tools = [
         schema
@@ -777,12 +784,98 @@ def create_extractor(
     builder.add_node(_Patch(llm, valid_tool_names=tool_names).as_runnable())
     builder.add_node("validate", validator)
 
+    def generate_missing_tool_node(state: ExtractionState) -> dict:
+        """Generate a call to the missing required tool."""
+        validated_calls = []
+        for msg in state.messages:
+            if isinstance(msg, AIMessage):
+                for tc in msg.tool_calls:
+                    # Exclude sentinel tool call
+                    if tc['id'] != '--sentinel-for-missing-tool--':
+                        validated_calls.append(tc)
+        
+        prompt = (
+            "You previously generated valid tool calls for the following tools: "
+            f"{[tc['name'] for tc in validated_calls]}. However, you missed the required tool(s): "
+            f"{state.required_tools}. Please generate a call for the missing required tool(s) based on the conversation. "
+            "**ONLY** generate the missing tool(s)."
+        )
+        
+        # Create a new set of messages for the LLM, excluding previous AI and tool messages
+        messages = [m for m in state.messages if not isinstance(m, (AIMessage, ToolMessage))]
+        messages.append(HumanMessage(content=prompt))
+        
+        # Use the original bound LLM to generate the missing tool call
+        missing_tools = list(set(state.required_tools) - {tc['name'] for tc in validated_calls})
+        tool_choice = missing_tools[0] if len(missing_tools) == 1 else "any"
+        new_ai_message = llm.bind_tools(_extract_tools, tool_choice=tool_choice).invoke(messages)
+        
+        return {"messages": [new_ai_message]}
+
+    def merge_tool_calls_node(state: ExtractionState) -> dict:
+        """Merge the newly generated tool call with the previously validated ones."""
+        original_ai_message = None
+        new_ai_message = None
+        for msg in reversed(state.messages):
+            if isinstance(msg, AIMessage):
+                if new_ai_message is None:
+                    new_ai_message = msg
+                else:
+                    original_ai_message = msg
+                    break
+        
+        if original_ai_message and new_ai_message:
+            # Get tool calls that are not sentinel
+            original_tool_calls = [tc for tc in original_ai_message.tool_calls if tc['id'] != '--sentinel-for-missing-tool--']
+            new_tool_calls = new_ai_message.tool_calls
+            
+            merged_tool_calls = original_tool_calls + new_tool_calls
+            
+            # Create a new AIMessage with the merged tool calls
+            merged_ai_message = AIMessage(
+                content=original_ai_message.content,
+                tool_calls=merged_tool_calls,
+                id=original_ai_message.id,
+                usage_metadata={
+                    "input_tokens": (original_ai_message.usage_metadata or {}).get("input_tokens", 0) + (new_ai_message.usage_metadata or {}).get("input_tokens", 0),
+                    "output_tokens": (original_ai_message.usage_metadata or {}).get("output_tokens", 0) + (new_ai_message.usage_metadata or {}).get("output_tokens", 0),
+                    "total_tokens": (original_ai_message.usage_metadata or {}).get("total_tokens", 0) + (new_ai_message.usage_metadata or {}).get("total_tokens", 0),
+                },
+                response_metadata={**original_ai_message.response_metadata, **new_ai_message.response_metadata},
+                additional_kwargs={**original_ai_message.additional_kwargs, **new_ai_message.additional_kwargs}
+            )
+            
+            # Replace the old AIMessages and their corresponding ToolMessages with the new merged one
+            original_ai_message_index = -1
+            for i, msg in enumerate(state.messages):
+                if msg.id == original_ai_message.id:
+                    original_ai_message_index = i
+                    break
+            
+            if original_ai_message_index != -1:
+                # Keep all messages up to the original AI message
+                final_messages = state.messages[:original_ai_message_index]
+                # Add the new merged message
+                final_messages.append(merged_ai_message)
+                return {"messages": final_messages}
+
+            # Fallback to old logic if something goes wrong with index finding
+            final_messages = [m for m in state.messages if not isinstance(m, (AIMessage, ToolMessage))]
+            final_messages.append(merged_ai_message)
+            return {"messages": final_messages}
+        
+        # Fallback if something goes wrong
+        return {"messages": state.messages}
+
+    builder.add_node("generate_missing_tool", generate_missing_tool_node)
+    builder.add_node("merge_tool_calls", merge_tool_calls_node)
+
     def del_tool_call(state: DeletionState) -> dict:
         return {
             "messages": MessageOp(op="delete", target=state.deletion_target),
         }
 
-    builder.add_node(del_tool_call)
+    builder.add_node("__del_tool_call__", del_tool_call)
 
     def enter(state: ExtractionState) -> Literal["extract", "extract_updates"]:
         if state.existing:
@@ -806,65 +899,98 @@ def create_extractor(
         max_attempts = config["configurable"].get("max_attempts", DEFAULT_MAX_ATTEMPTS)
         if state.attempts >= max_attempts:
             return "__end__"
-        # Only continue if we need to patch the tool call
+
+        # Defensive check for AIMessage
+        if not any(isinstance(m, AIMessage) for m in state.messages):
+            logger.warning("No AIMessage found in state.messages, ending processing")
+            return "__end__"
+
+        # Find the last AI message and the tool messages that follow it.
+        last_ai_message_index = -1
+        for i in range(len(state.messages) - 1, -1, -1):
+            if isinstance(state.messages[i], AIMessage):
+                last_ai_message_index = i
+                break
+        
+        # Get all tool messages after the last AI message
+        relevant_tool_messages = [
+            m for m in state.messages[last_ai_message_index + 1:] if isinstance(m, ToolMessage)
+        ]
+
+        # Check if any of the relevant tool messages are errors
+        has_errors = any(m.additional_kwargs.get("is_error") for m in relevant_tool_messages)
+        
+        if not has_errors:
+            return "__end__"
+
+        # If we are here, it means there are errors, so we proceed with retry logic.
         to_send = []
         bumped = False
         
-        # Add defensive check - ensure there's at least one AIMessage in history
-        has_ai_message = any(isinstance(m, AIMessage) for m in state.messages)
-        if not has_ai_message:
-            logger.warning("No AIMessage found in state.messages, ending processing")
-            return "__end__"
-            
-        for m in reversed(state.messages):
-            if isinstance(m, AIMessage):
-                break
-            if isinstance(m, ToolMessage):
-                # Check additional_kwargs for "is_error" which is set by the new ValidationNode
-                if m.additional_kwargs.get("is_error") is True:
-                    messages_for_fixing = _get_history_for_tool_call(
-                        state.messages, m.tool_call_id
-                    )
-                    
-                    # Ensure tool_call_id is properly set
-                    if not hasattr(m, "tool_call_id") or not m.tool_call_id:
-                        logger.warning(f"Missing tool_call_id on message {m}, skipping")
-                        continue
-                        
-                    to_send.append(
-                        Send(
-                            "patch",
-                            ExtendedExtractState(
-                                **{
-                                    **asdict(state),
-                                    "messages": messages_for_fixing,
-                                    "tool_call_id": m.tool_call_id,
-                                    "bump_attempt": not bumped,
-                                }
-                            ),
-                        )
-                    )
-                    bumped = True
+        for m in reversed(relevant_tool_messages):
+            if m.additional_kwargs.get("is_missing_tool_error"):
+                if m.additional_kwargs.get("is_empty_response"):
+                    # Full retry
+                    clean_history = [msg for msg in state.messages if not isinstance(msg, (AIMessage, ToolMessage))]
+                    retry_state = ExtractionState(**{**asdict(state), "messages": clean_history, "attempts": state.attempts + 1})
+                    return [Send("extract", retry_state)]
                 else:
-                    # Safe deletion handling
-                    if not hasattr(m, "id") or not m.id:
-                        logger.warning(f"Missing id on message {m}, skipping deletion")
-                        continue
-                    # We want to delete the validation tool calls
-                    # anyway to avoid mixing branches during fan-in
+                    # Surgical retry
+                    clean_history = [msg for msg in state.messages if not isinstance(msg, ToolMessage)]
+                    retry_state = ExtractionState(**{**asdict(state), "messages": clean_history, "attempts": state.attempts + 1})
+                    return [Send("generate_missing_tool", retry_state)]
+
+            if m.additional_kwargs.get("is_error"):
+                error_content = str(m.content)
+                # # Construct a complete history for the LLM to make an informed patch.
+                # # This includes all messages up to the failed AI message, plus the error details.
+                messages_for_fixing = (
+                    state.messages[: last_ai_message_index + 1]
+                    + [HumanMessage(content=error_content)]
+                )
+                
+                # We must pass the full message history to the patch node so that it can
+                # correctly identify and delete the error-containing ToolMessage from the state.
+                # The specialized 'messages_for_fixing' prompt is passed via the validation_context
+                # to be used for the LLM call, without overwriting the main message history.
+                # This prevents an infinite loop where the undeleted error message would
+                # cause the graph to repeatedly trigger the patch node.
+                new_context = (state.validation_context or {}).copy()
+                new_context["__messages_for_fixing"] = messages_for_fixing
+
+                to_send.append(
+                    Send(
+                        "patch",
+                        ExtendedExtractState(
+                            **{
+                                **asdict(state),
+                                "validation_context": new_context,
+                                "tool_call_id": m.tool_call_id,
+                                "bump_attempt": not bumped,
+                            }
+                        ),
+                    )
+                )
+                bumped = True
+            else:
+                # This is a valid tool message, but since we are in a retry loop,
+                # we still need to clean it up to avoid polluting the next turn.
+                if hasattr(m, "id") and m.id:
                     to_send.append(
                         Send(
-                            "del_tool_call",
-                            DeletionState(
-                                deletion_target=str(m.id), messages=state.messages
-                            ),
+                            "__del_tool_call__",
+                            DeletionState(deletion_target=str(m.id), messages=state.messages),
                         )
                     )
+
         return to_send
 
     builder.add_conditional_edges(
-        "validate", handle_retries, path_map=["__end__", "patch", "del_tool_call"]
+        "validate", handle_retries, path_map=["__end__", "patch", "__del_tool_call__", "generate_missing_tool", "extract"]
     )
+    
+    builder.add_edge("generate_missing_tool", "merge_tool_calls")
+    builder.add_edge("merge_tool_calls", "validate")
 
     def sync(state: ExtractionState, config: RunnableConfig) -> dict:
         return {"messages": []}
@@ -924,7 +1050,7 @@ def create_extractor(
                         name=tool_name, args=tool_args, id=tool_call_id
                     )
                     msg.tool_calls = [reconstructed_tool_call]
-                    response_metadata.append({"id": tool_call_id, "name": tool_name})
+                    response_metadata.append({"id": tool_call_id, "name": tool_name, "usage_metadata": msg.usage_metadata})
                 else:
                     logger.warning(f"Unrecognized tool call from Gemini: {tool_name}")
 
@@ -955,10 +1081,17 @@ def create_extractor(
 
                 # Validate and append the response
                 try:
-                    validated_response = schema_to_validate.model_validate(tc["args"])
+                    validation_context = state.get("validation_context")
+                    validated_response = schema_to_validate.model_validate(
+                        tc["args"], context=validation_context
+                    )
                     responses.append(validated_response)
                     
-                    meta = {"id": tc["id"]}
+                    meta = {
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "usage_metadata": msg.usage_metadata,
+                    }
                     if json_doc_id := updated_docs.get(tc["id"]):
                         meta["json_doc_id"] = json_doc_id
                     response_metadata.append(meta)
@@ -966,6 +1099,13 @@ def create_extractor(
                     logger.error(f"Error validating tool call for {tc['name']}: {e}")
                     continue
 
+        # Normalize usage metadata
+        if msg and msg.usage_metadata:
+            # Ensure output_tokens is present, calculating it if necessary.
+            # This prevents the AIMessage property from falling back to total_tokens.
+            if "output_tokens" not in msg.usage_metadata and "total_tokens" in msg.usage_metadata and "input_tokens" in msg.usage_metadata:
+                msg.usage_metadata["output_tokens"] = msg.usage_metadata["total_tokens"] - msg.usage_metadata["input_tokens"]
+        
         return {
             "messages": [msg],
             "responses": responses,
@@ -984,10 +1124,12 @@ def create_extractor(
         if isinstance(state, dict):
             if isinstance(state.get("messages"), PromptValue):
                 state = {**state, "messages": state["messages"].to_messages()}  # type: ignore
+            if required_tools:
+                state["required_tools"] = required_tools
         else:
             if hasattr(state, "messages"):
                 state = {"messages": state.messages.to_messages()}  # type: ignore
-
+ 
         return cast(dict, state)
-
+ 
     return coerce_inputs | compiled | filter_state

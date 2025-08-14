@@ -70,7 +70,7 @@ class _Patch:
         if not msg.id:
             msg.id = str(uuid.uuid4())
         # We will directly update the messages in the state before validation.
-        msg_ops = _infer_patch_message_ops(messages, msg.tool_calls, target_id)
+        msg_ops = _infer_patch_message_ops(messages, msg, target_id)
         return {
             "messages": msg_ops,
             "attempts": 1 if bump_attempt else 0,
@@ -85,7 +85,7 @@ class _Patch:
             # Fallback: Find the ID from the last error ToolMessage in the history
             target_id = None
             for msg in reversed(state.messages):
-                if isinstance(msg, ToolMessage) and getattr(msg, "status", None) == "error":
+                if isinstance(msg, ToolMessage) and msg.additional_kwargs.get("is_error"):
                     target_id = msg.tool_call_id
                     break
             # Assume bump_attempt should be True if we had to infer the ID
@@ -93,7 +93,7 @@ class _Patch:
             return target_id, bool(target_id)
 
     async def ainvoke(
-        self, state: ExtractionState, config: RunnableConfig # Changed type hint
+        self, state: Any, config: RunnableConfig
     ) -> Command[Literal["sync", "__end__"]]:
         """Generate a JSONPatch to correct the validation error and heal the tool call."""
         # --- Get target_id and bump_attempt safely ---
@@ -103,9 +103,18 @@ class _Patch:
              return Command(goto="__end__") # Cannot proceed without target_id
         # --- END Get target_id ---
 
+        # Determine which messages to use for the LLM prompt.
+        # The specialized prompt is passed via context to avoid breaking the
+        # main message history, which is needed for state cleanup.
+        messages_for_llm = (
+            state.validation_context.get("__messages_for_fixing")
+            if hasattr(state, "validation_context") and state.validation_context
+            else state.messages
+        )
+
         try:
             # Pass only the messages to the LLM
-            msg = await self.bound.ainvoke(state.messages, config)
+            msg = await self.bound.ainvoke(messages_for_llm, config)
         except Exception as e:
             logger.error(f"_Patch ainvoke LLM call failed: {e}")
             return Command(goto="__end__")
@@ -113,7 +122,7 @@ class _Patch:
         return Command(
             update=self._tear_down(
                 cast(AIMessage, msg),
-                state.messages,
+                state.messages, # Always use the full history for teardown
                 target_id, # Use extracted target_id
                 bump_attempt, # Use extracted bump_attempt
             ),
@@ -121,7 +130,7 @@ class _Patch:
         )
 
     def invoke(
-        self, state: ExtractionState, config: RunnableConfig # Changed type hint
+        self, state: Any, config: RunnableConfig
     ) -> Command[Literal["sync", "__end__"]]:
         """Generate a JSONPatch to correct the validation error and heal the tool call."""
          # --- Get target_id and bump_attempt safely ---
@@ -131,9 +140,16 @@ class _Patch:
              return Command(goto="__end__") # Cannot proceed without target_id
         # --- END Get target_id ---
 
+        # Determine which messages to use for the LLM prompt.
+        messages_for_llm = (
+            state.validation_context.get("__messages_for_fixing")
+            if hasattr(state, "validation_context") and state.validation_context
+            else state.messages
+        )
+
         try:
              # Pass only the messages to the LLM
-            msg = self.bound.invoke(state.messages, config)
+            msg = self.bound.invoke(messages_for_llm, config)
         except Exception as e:
             logger.error(f"_Patch invoke LLM call failed: {e}")
             return Command(goto="__end__")
@@ -141,7 +157,7 @@ class _Patch:
         return Command(
             update=self._tear_down(
                 cast(AIMessage, msg),
-                state.messages,
+                state.messages, # Always use the full history for teardown
                 target_id, # Use extracted target_id
                 bump_attempt, # Use extracted bump_attempt
             ),
@@ -189,12 +205,12 @@ def _get_message_op(
                                     })
                         except Exception as e:
                            # Enhanced logging for patch application failure
-                           logger.error(f"Error applying patch for target_id '{target_id}'. Exception: {repr(e)}", exc_info=True)
-                           logger.error(f"  Original Tool Call Args (tool_call['args'] which contains patches): {tool_call.get('args')}")
+                           # logger.error(f"Error applying patch for target_id '{target_id}'. Exception: {repr(e)}", exc_info=True)
+                           # logger.error(f"  Original Tool Call Args (tool_call['args'] which contains patches): {tool_call.get('args')}")
                            # Log processed patches if available
                            try:
                                processed_patches = _ensure_patches(tool_call.get('args', {}))
-                               logger.error(f"  Processed Patches from tool_call['args']: {processed_patches}")
+                            #    logger.error(f"  Processed Patches from tool_call['args']: {processed_patches}")
                            except Exception as ensure_e:
                                logger.error(f"  Error during _ensure_patches call: {repr(ensure_e)}")
                     else:
@@ -209,15 +225,38 @@ def _get_message_op(
 
 @ls.traceable(tags=["langsmith:hidden"])
 def _infer_patch_message_ops(
-    messages: Sequence[AnyMessage], tool_calls: List[ToolCall], target_id: str
+    messages: Sequence[AnyMessage],
+    msg_with_patches: AIMessage,
+    target_id: str,
 ):
+    """Create all message operations based on the patch LLM call."""
     ops = [
         op
-        for tool_call in tool_calls
+        for tool_call in msg_with_patches.tool_calls
         for op in _get_message_op(
             messages, tool_call["args"], tool_call["name"], target_id=target_id
         )
     ]
+    
+    # Add an operation to update the usage metadata of the original AI message
+    if msg_with_patches.usage_metadata:
+        # Find the ID of the original AI message that is being patched
+        original_msg_id = None
+        for m in reversed(messages):
+            if isinstance(m, AIMessage):
+                if any(tc["id"] == target_id for tc in m.tool_calls):
+                    original_msg_id = m.id
+                    break
+        
+        if original_msg_id:
+            ops.append({
+                "op": "update_usage_metadata",
+                "target": {
+                    "msg_id": original_msg_id,
+                    "usage": msg_with_patches.usage_metadata,
+                },
+            })
+
     return ops
 
 def _fix_string_concat(

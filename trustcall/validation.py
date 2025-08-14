@@ -15,6 +15,7 @@ from typing import (
     Type,
     Union,
     cast,
+    List
 )
 from langchain_core.messages import (
     AIMessage,
@@ -242,9 +243,10 @@ logger = logging.getLogger("extraction") # Keep this
 class _ExtendedValidationNode(ValidationNode): # Inherit from local ValidationNode
     """Extended validation node with support for deletion."""
     
-    def __init__(self, *args, enable_deletes: bool = False, **kwargs):
+    def __init__(self, *args, enable_deletes: bool = False, required_tools: Optional[List[str]] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.enable_deletes = enable_deletes
+        self.required_tools = required_tools
 
     def _func(self, input: Any, config: RunnableConfig) -> Any: # type: ignore
 
@@ -317,9 +319,9 @@ class _ExtendedValidationNode(ValidationNode): # Inherit from local ValidationNo
                 try:
                     # Log detailed errors if available (Pydantic v2)
                     detailed_errors = e.errors() if hasattr(e, 'errors') else str(e)
-                    logger.error(f"Detailed Pydantic errors: {json.dumps(detailed_errors, indent=2)}")
+                    logger.debug(f"Detailed Pydantic errors: {json.dumps(detailed_errors)}")
                 except Exception as log_e:
-                    logger.error(f"Error logging detailed Pydantic errors: {log_e}")
+                    logger.debug(f"Error logging detailed Pydantic errors: {log_e}")
                 
                 # Use _format_error from the base class (or the one passed in __init__)
                 error_message = self._format_error(e, call, current_schema_to_validate)
@@ -349,6 +351,50 @@ class _ExtendedValidationNode(ValidationNode): # Inherit from local ValidationNo
         with get_executor_for_config(config) as executor:
             outputs = [*executor.map(run_one_extended, message.tool_calls)]
         
+        if self.required_tools:
+            called_tool_names = {tc['name'] for tc in message.tool_calls}
+            is_missing = not any(req_tool in called_tool_names for req_tool in self.required_tools)
+
+            if is_missing:
+                if not called_tool_names:
+                    # Case 1: No tools were called at all. This suggests a larger failure.
+                    error_content = (
+                        "**ERROR**:\n"
+                        "```"
+                        "Missing Required Tool Error: The response did not include any tool calls, "
+                        "but at least one was required.\n"
+                        f"- Expected one of: {self.required_tools}\n"
+                        "- Actually called: None\n"
+                        "**IMPORTANT** Correction: Please re-evaluate the request and generate a call to the required tool. "
+                        "You MUST call one of the tools listed in 'Expected one of'."
+                        "```"
+                    )
+                    outputs.append(ToolMessage(
+                        content=error_content,
+                        name="RequiredToolResponseMissing",
+                        tool_call_id="--sentinel-for-empty-response--",
+                        additional_kwargs={"is_error": True, "is_missing_tool_error": True, "is_empty_response": True}
+                    ))
+                else:
+                    # Case 2: Some tools were called, but not the required one. Surgical fix is appropriate.
+                    error_content = (
+                        "**ERROR**:\n"
+                        "```"
+                        "Missing Required Tool Error: The response did not include **ALL** required tool calls.\n"
+                        f"- Required Tool Calls: {self.required_tools}\n"
+                        # f"- Tools Actually called: {list(called_tool_names)}\n"
+                        f"**IMPORTANT** Correction: You **MUST** generate a tool call for the missing required tool(s) "
+                        "based on the initial request. The missing tool(s) are: "
+                        f"{list(set(self.required_tools) - called_tool_names)}\n"
+                        "```"
+                    )
+                    outputs.append(ToolMessage(
+                        content=error_content,
+                        name="RequiredToolResponseMissing",
+                        tool_call_id="--sentinel-for-missing-tool--",
+                        additional_kwargs={"is_error": True, "is_missing_tool_error": True}
+                    ))
+
         if output_type == "list":
             return outputs
         else:

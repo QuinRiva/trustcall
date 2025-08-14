@@ -123,33 +123,6 @@ def _try_parse_json_value(value):
     return value
 
 
-def _get_history_for_tool_call(messages: List[AnyMessage], tool_call_id: str):
-    """Get the history of messages related to a specific tool call."""
-    results = []
-    seen_ai_message = False
-    for m in reversed(messages):
-        if isinstance(m, AIMessage):
-            if not seen_ai_message:
-                tool_calls = [tc for tc in m.tool_calls if tc["id"] == tool_call_id]
-                if hasattr(m, "model_dump"):
-                    d = m.model_dump(exclude={"tool_calls", "content"})
-                else:
-                    d = m.dict(exclude={"tool_calls", "content"})
-                m = AIMessage(
-                    **d,
-                    # Frequently have partial_json blocks that are
-                    # invalid if sent back to the API
-                    content=str(m.content),
-                    tool_calls=tool_calls,
-                )
-            seen_ai_message = True
-        if isinstance(m, ToolMessage):
-            if m.tool_call_id != tool_call_id and not seen_ai_message:
-                continue
-        results.append(m)
-    return list(reversed(results))
-
-
 def _make_schema_gapic_compatible(schema_node: Any) -> Any:
     """
     Recursively traverses a JSON schema, stripping unsupported fields and
