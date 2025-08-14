@@ -28,7 +28,7 @@ import logging # Corrected import
 logger = logging.getLogger(__name__) # Added logger instance back
 
 class MessageOp(TypedDict):
-    op: Literal["delete", "update_tool_call", "update_tool_name"]
+    op: Literal["delete", "update_tool_call", "update_tool_name", "update_usage_metadata"]
     target: Union[str, Any]  # ToolCall
     
 def _apply_message_ops(
@@ -95,6 +95,28 @@ def _apply_message_ops(
                         m.tool_calls = new
                     messages_.append(m)
             messages = messages_
+        elif message_op["op"] == "update_usage_metadata":
+            update_targ = cast(dict, message_op["target"])
+            usage_to_add = update_targ.get("usage")
+            if not usage_to_add:
+                continue
+
+            messages_ = []
+            for m in messages:
+                if isinstance(m, AIMessage) and m.id == update_targ.get("msg_id"):
+                    updated_message = m.model_copy()
+                    if updated_message.usage_metadata:
+                        # Aggregate the token counts
+                        current_usage = updated_message.usage_metadata
+                        current_usage["input_tokens"] = current_usage.get("input_tokens", 0) + usage_to_add.get("input_tokens", 0)
+                        current_usage["output_tokens"] = current_usage.get("output_tokens", 0) + usage_to_add.get("output_tokens", 0)
+                        current_usage["total_tokens"] = current_usage.get("total_tokens", 0) + usage_to_add.get("total_tokens", 0)
+                    else:
+                        updated_message.usage_metadata = usage_to_add.copy()
+                    messages_.append(updated_message)
+                else:
+                    messages_.append(m)
+            messages = messages_
         else:
             raise ValueError(f"Invalid operation: {message_op['op']}")
     return messages
@@ -148,6 +170,7 @@ class ExtractionState:
     """If you're updating an existing schema, provide the existing schema here."""
     validation_context: Annotated[Optional[Dict[str, Any]], _keep_first] = field(default=None)
     """Arbitrary context dictionary passed from input to Pydantic validation."""
+    required_tools: Optional[List[str]] = field(default=None)
 
 
 @dataclass(kw_only=True)
