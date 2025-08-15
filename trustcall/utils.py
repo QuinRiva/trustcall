@@ -39,7 +39,7 @@ GEMINI_SUPPORTED_FIELDS = {
     'type', 'format', 'title', 'description', 'nullable', 'default', 'items',
     'minItems', 'maxItems', 'enum', 'properties', 'propertyOrdering', 'required',
     'minProperties', 'maxProperties', 'minimum', 'maximum', 'minLength',
-    'maxLength', 'pattern', 'example', 'anyOf', 'additionalProperties', '$ref', '$defs'
+    'maxLength', 'pattern', 'example', 'anyOf', 'ref', 'defs', 'discriminator', 'oneOf'
 }
 
 
@@ -156,19 +156,30 @@ def _make_schema_gapic_compatible(schema_node: Any) -> Any:
             else:
                 new_node[new_key] = value
 
-        # Handle type uppercasing and anyOf logic on the transformed node
+        # Handle type uppercasing and anyOf/oneOf logic on the transformed node
         if "type" in new_node and isinstance(new_node["type"], str):
             new_node["type"] = new_node["type"].upper()
 
-        if "anyOf" in new_node:
-            is_nullable = any(t.get("type") == "NULL" for t in new_node.get("anyOf", []))
-            non_null_schema = next((item for item in new_node.get("anyOf", []) if item.get("type") != "NULL"), None)
-            
-            del new_node["anyOf"]
-            if non_null_schema:
-                new_node.update(non_null_schema)
-            if is_nullable:
-                new_node["nullable"] = True
+        # Handle both anyOf and oneOf (Pydantic uses oneOf for discriminated unions)
+        for union_key in ["anyOf", "oneOf"]:
+            if union_key in new_node:
+                union_items = new_node.get(union_key, [])
+                null_items = [t for t in union_items if t.get("type") == "NULL"]
+                non_null_items = [t for t in union_items if t.get("type") != "NULL"]
+                
+                # Only collapse if this is a simple nullable union (one NULL + one non-NULL)
+                if union_key == "anyOf" and len(null_items) == 1 and len(non_null_items) == 1:
+                    # This is a nullable union pattern, collapse it
+                    del new_node[union_key]
+                    new_node.update(non_null_items[0])
+                    new_node["nullable"] = True
+                else:
+                    # This is a true union (multiple non-null types or other patterns)
+                    # Keep the union as-is for Vertex AI 2.0.28+ to handle
+                    # Just ensure types are uppercased within the union items
+                    for item in new_node[union_key]:
+                        if "type" in item and isinstance(item["type"], str):
+                            item["type"] = item["type"].upper()
         
         return new_node
     elif isinstance(schema_node, list):

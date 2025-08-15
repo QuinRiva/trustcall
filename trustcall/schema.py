@@ -36,20 +36,14 @@ from pydantic import (
 
 from trustcall.utils import (
     _exclude_none,
+    GEMINI_SUPPORTED_FIELDS,
 )
 
 logger = logging.getLogger("extraction")
 DEFAULT_GEMINI_SCHEMA_GEN_DEPTH = 5
 
 # Based on the error message from the Google API client.
-# Available Fields(except extensions): "['type', 'format', 'title', 'description', 'nullable', 'default', 'items', 'minItems', 'maxItems', 'enum', 'properties', 'propertyOrdering', 'required', 'minProperties', 'maxProperties', 'minimum', 'maximum', 'minLength', 'maxLength', 'pattern', 'example', 'anyOf', 'additionalProperties', 'ref', 'defs']"
-GEMINI_SUPPORTED_FIELDS = {
-    'type', 'format', 'title', 'description', 'nullable', 'default', 'items',
-    'minItems', 'maxItems', 'enum', 'properties', 'propertyOrdering', 'required',
-    'minProperties', 'maxProperties', 'minimum', 'maximum', 'minLength',
-    'maxLength', 'pattern', 'example', 'anyOf', 'additionalProperties',
-    # Not including $ref and $defs as this function handles inlining
-}
+# See trustcall.utils.GEMINI_SUPPORTED_FIELDS for the centralized allowlist used during Gemini schema filtering.
 
 
 def get_canonical_def_name(
@@ -150,19 +144,32 @@ def _transform_schema_for_gemini_recursive(
         else:
             new_node[key] = value
 
-    # 3. Handle type uppercasing and anyOf logic on the transformed node
+    # 3. Handle type uppercasing and anyOf/oneOf logic on the transformed node
     if "type" in new_node and isinstance(new_node["type"], str):
         new_node["type"] = new_node["type"].upper()
 
-    if "anyOf" in new_node:
-        is_nullable = any(t.get("type") == "NULL" for t in new_node.get("anyOf", []))
-        non_null_schema = next((item for item in new_node.get("anyOf", []) if item.get("type") != "NULL"), None)
-        
-        del new_node["anyOf"]
-        if non_null_schema:
-            new_node.update(non_null_schema)
-        if is_nullable:
-            new_node["nullable"] = True
+    # Handle both anyOf and oneOf (Pydantic uses oneOf for discriminated unions)
+    # Note: With langchain-google-vertexai>=2.0.28, Vertex AI now supports anyOf/oneOf natively,
+    # so we preserve true unions and only collapse nullable unions (anyOf with one NULL + one non-NULL)
+    for union_key in ["anyOf", "oneOf"]:
+        if union_key in new_node:
+            union_items = new_node.get(union_key, [])
+            null_items = [t for t in union_items if t.get("type") == "NULL"]
+            non_null_items = [t for t in union_items if t.get("type") != "NULL"]
+            
+            # Only collapse if this is a simple nullable union (one NULL + one non-NULL)
+            if union_key == "anyOf" and len(null_items) == 1 and len(non_null_items) == 1:
+                # This is a nullable union pattern, collapse it
+                del new_node[union_key]
+                new_node.update(non_null_items[0])
+                new_node["nullable"] = True
+            else:
+                # This is a true union (multiple non-null types or other patterns)
+                # Keep the union as-is for Vertex AI 2.0.28+ to handle
+                # Just ensure types are uppercased within the union items
+                for item in new_node[union_key]:
+                    if "type" in item and isinstance(item["type"], str):
+                        item["type"] = item["type"].upper()
 
     return _exclude_none(new_node)
 
