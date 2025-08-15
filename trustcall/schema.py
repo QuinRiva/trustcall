@@ -149,8 +149,7 @@ def _transform_schema_for_gemini_recursive(
         new_node["type"] = new_node["type"].upper()
 
     # Handle both anyOf and oneOf (Pydantic uses oneOf for discriminated unions)
-    # Note: With langchain-google-vertexai>=2.0.28, Vertex AI now supports anyOf/oneOf natively,
-    # so we preserve true unions and only collapse nullable unions (anyOf with one NULL + one non-NULL)
+    # Note: GAPIC protobuf only supports anyOf, not oneOf, so we convert oneOf to anyOf
     for union_key in ["anyOf", "oneOf"]:
         if union_key in new_node:
             union_items = new_node.get(union_key, [])
@@ -165,8 +164,12 @@ def _transform_schema_for_gemini_recursive(
                 new_node["nullable"] = True
             else:
                 # This is a true union (multiple non-null types or other patterns)
-                # Keep the union as-is for Vertex AI 2.0.28+ to handle
-                # Just ensure types are uppercased within the union items
+                # Convert oneOf to anyOf for GAPIC compatibility
+                if union_key == "oneOf":
+                    new_node["anyOf"] = new_node.pop("oneOf")
+                    union_key = "anyOf"  # Update reference for the loop below
+                    
+                # Ensure types are uppercased within the union items
                 for item in new_node[union_key]:
                     if "type" in item and isinstance(item["type"], str):
                         item["type"] = item["type"].upper()

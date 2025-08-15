@@ -35,12 +35,25 @@ from pydantic import BaseModel, create_model as create_model_from_schema
 
 logger = logging.getLogger("extraction")
 
+# Note: 'discriminator' and 'oneOf' are included here for schema processing but will be filtered
+# out before GAPIC conversion since protobuf doesn't support them
 GEMINI_SUPPORTED_FIELDS = {
     'type', 'format', 'title', 'description', 'nullable', 'default', 'items',
     'minItems', 'maxItems', 'enum', 'properties', 'propertyOrdering', 'required',
     'minProperties', 'maxProperties', 'minimum', 'maximum', 'minLength',
     'maxLength', 'pattern', 'example', 'anyOf', 'ref', 'defs', 'discriminator', 'oneOf'
 }
+
+# Fields that are actually supported by the GAPIC protobuf schema (v1.109.0)
+# Based on actual Schema protobuf fields from google.cloud.aiplatform_v1beta1.types.Schema
+# Note: JSON field names map to protobuf field names (e.g., 'type' -> 'type_', 'anyOf' -> 'any_of')
+GAPIC_SUPPORTED_FIELDS = {
+    'type', 'format', 'title', 'description', 'nullable', 'default', 'items',
+    'minItems', 'maxItems', 'enum', 'properties', 'propertyOrdering', 'required',
+    'minProperties', 'maxProperties', 'minimum', 'maximum', 'minLength',
+    'maxLength', 'pattern', 'example', 'anyOf', 'additionalProperties', 'ref', 'defs'
+}
+# IMPORTANT: 'oneOf' and 'discriminator' are NOT supported by GAPIC protobuf
 
 
 def is_gemini_model(llm: BaseChatModel) -> bool:
@@ -139,8 +152,17 @@ def _make_schema_gapic_compatible(schema_node: Any) -> Any:
             elif key == '$defs':
                 new_key = 'defs'
 
+            # Skip discriminator and oneOf as they're not supported by GAPIC protobuf
+            # (we preserve them during processing but remove for final GAPIC conversion)
+            if key in ('discriminator', 'oneOf'):
+                # Convert oneOf to anyOf for GAPIC compatibility
+                if key == 'oneOf':
+                    new_key = 'anyOf'
+                else:
+                    continue
+                
             # Filter unsupported keys, but always allow 'properties'
-            if new_key not in GEMINI_SUPPORTED_FIELDS and new_key != 'properties':
+            if new_key not in GAPIC_SUPPORTED_FIELDS and new_key != 'properties':
                 continue
 
             # Recurse on nested structures
