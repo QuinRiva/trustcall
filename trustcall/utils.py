@@ -183,26 +183,61 @@ def _make_schema_gapic_compatible(schema_node: Any) -> Any:
             new_node["type"] = new_node["type"].upper()
 
         # Handle both anyOf and oneOf (Pydantic uses oneOf for discriminated unions)
+        # GAPIC does not accept a literal "NULL" type, even deep inside nested unions.
+        # Normalize all unions as follows:
+        # - Remove any branches with type == "NULL"
+        # - Set nullable=True on the current node if any null branch was present
+        # - If exactly one non-null branch remains, collapse to that branch
+        # - If multiple non-null branches remain, keep them as anyOf
         for union_key in ["anyOf", "oneOf"]:
             if union_key in new_node:
+                # Normalize key to 'anyOf' for GAPIC
+                items_key = "anyOf"
                 union_items = new_node.get(union_key, [])
-                null_items = [t for t in union_items if t.get("type") == "NULL"]
-                non_null_items = [t for t in union_items if t.get("type") != "NULL"]
-                
-                # Only collapse if this is a simple nullable union (one NULL + one non-NULL)
-                if union_key == "anyOf" and len(null_items) == 1 and len(non_null_items) == 1:
-                    # This is a nullable union pattern, collapse it
-                    del new_node[union_key]
-                    new_node.update(non_null_items[0])
+                filtered: List[Dict[str, Any]] = []
+                had_null = False
+
+                for it in union_items:
+                    if isinstance(it, dict):
+                        t = it.get("type")
+                        if isinstance(t, str) and t.upper() == "NULL":
+                            had_null = True
+                            continue
+                        # Uppercase type strings for GAPIC compatibility
+                        if "type" in it and isinstance(it["type"], str):
+                            it["type"] = it["type"].upper()
+                        filtered.append(it)
+                    else:
+                        # Non-dict entries (unlikely in valid schema) are preserved as-is
+                        filtered.append(it)
+
+                # Mark node as nullable if any null branches were present
+                if had_null:
                     new_node["nullable"] = True
+
+                # Replace the union according to remaining items
+                if len(filtered) == 0:
+                    # Only NULL existed → provide a permissive fallback
+                    if union_key in new_node:
+                        del new_node[union_key]
+                    new_node["type"] = "OBJECT"
+                elif len(filtered) == 1:
+                    # Collapse to single remaining branch
+                    if union_key in new_node:
+                        del new_node[union_key]
+                    branch = filtered[0]
+                    if isinstance(branch, dict):
+                        for k, v in branch.items():
+                            # Don't clobber nullable we just set
+                            if k == "nullable":
+                                continue
+                            new_node[k] = v
                 else:
-                    # This is a true union (multiple non-null types or other patterns)
-                    # Keep the union as-is for Vertex AI 2.0.28+ to handle
-                    # Just ensure types are uppercased within the union items
-                    for item in new_node[union_key]:
-                        if "type" in item and isinstance(item["type"], str):
-                            item["type"] = item["type"].upper()
-        
+                    # Keep a real union, but without NULLs, under 'anyOf'
+                    if union_key in new_node:
+                        del new_node[union_key]
+                    new_node[items_key] = filtered
+
         return new_node
     elif isinstance(schema_node, list):
         return [_make_schema_gapic_compatible(item) for item in schema_node]
