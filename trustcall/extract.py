@@ -735,11 +735,27 @@ def create_extractor(
     # Define error formatting
     def format_exception(error: BaseException, call: ToolCall, schema: Type[BaseModel]) -> str:
         return (
-            f"Error:\n\n```\n{str(error)}\n```\n"
-            "Expected Parameter Schema:\n\n"
-            + f"```json\n{_get_schema(schema, using_gemini, gemini_ref_strategy=gemini_ref_strategy, gemini_schema_recursion_depth=gemini_schema_recursion_depth)}\n```\n"
-            f"Please use PatchFunctionErrors to fix all validation errors."
-            f" for json_doc_id=[{call['id']}]."
+            "**IMPORTANT: This validation error is a SYMPTOM, not the root cause.**\n\n"
+            "Before patching, ask yourself: *What did I generate that caused this validation to fail?*\n"
+            "Common root causes:\n"
+            "- Returned an empty object `{}` when the schema required specific fields\n"
+            "- Omitted a required nested structure entirely\n"
+            "- Used wrong data types (string instead of object, etc.)\n"
+            "- Misunderstood the schema structure\n\n"
+            "The patch you create should address the ROOT CAUSE, not just silence the error.\n\n"
+            "---\n\n"
+            f"**Validation Error:**\n\n```\n{str(error)}\n```\n\n"
+            "**Expected Parameter Schema:**\n\n"
+            f"```json\n{_get_schema(schema, using_gemini, gemini_ref_strategy=gemini_ref_strategy, gemini_schema_recursion_depth=gemini_schema_recursion_depth)}\n```\n\n"
+            "**JSONPatch Operation Guide:**\n"
+            "- `input_value={}` (empty object): You returned an empty object where fields were required. "
+            "The path to those fields DOES NOT EXIST yet. Use `\"op\": \"add\"` to create them.\n"
+            "- `Field required [type=missing]` with non-empty parent: A sibling field exists but this one is missing. "
+            "Use `\"op\": \"add\"` to add the missing field.\n"
+            "- Wrong value type or validation failed on an existing field: The path EXISTS but has wrong content. "
+            "Use `\"op\": \"replace\"` to fix it.\n"
+            "- **CRITICAL**: `replace` FAILS SILENTLY if the path doesn't exist! When in doubt, use `add`.\n\n"
+            f"Use PatchFunctionErrors to fix all validation errors for json_doc_id=[{call['id']}]."
         )
     
     # Get the appropriate patching tools - Gemini supports simpler JSON schemas, so requires different tools

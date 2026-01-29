@@ -205,8 +205,8 @@ def _get_message_op(
                                     })
                         except Exception as e:
                            # Enhanced logging for patch application failure
-                           # logger.error(f"Error applying patch for target_id '{target_id}'. Exception: {repr(e)}", exc_info=True)
-                           # logger.error(f"  Original Tool Call Args (tool_call['args'] which contains patches): {tool_call.get('args')}")
+                           logger.error(f"Error applying patch for target_id '{target_id}'. Exception: {repr(e)}", exc_info=True)
+                           logger.error(f"  Original Tool Call Args (tool_call['args'] which contains patches): {tool_call.get('args')}")
                            # Log processed patches if available
                            try:
                                processed_patches = _ensure_patches(tool_call.get('args', {}))

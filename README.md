@@ -505,6 +505,28 @@ No fields omitted, and the important new information is seamlessly integrated.
 
 The `create_extractor` function offers additional parameters to fine-tune its behavior, especially for complex scenarios or specific LLM backends.
 
+#### Controlling Retry Behavior with `max_attempts`
+
+When validation errors occur, `trustcall` prompts the LLM to generate JSON Patch operations to fix the errors. You can control how many retry attempts are allowed before giving up.
+
+*   **`max_attempts`** (int, default=3):
+    *   Controls the maximum number of validation retry cycles the extractor will attempt.
+    *   This is configured via the `config` parameter when invoking the extractor, not when creating it.
+    *   **Usage:**
+        ```python
+        from trustcall import create_extractor
+
+        extractor = create_extractor(llm, tools=[MySchema])
+        
+        # Increase max attempts for complex schemas with strict validation
+        result = extractor.invoke(
+            {"messages": [("user", "Extract the information")]},
+            config={"configurable": {"max_attempts": 5}}
+        )
+        ```
+    *   **When to increase:** If you have complex Pydantic validators (e.g., cross-field validation, custom `@model_validator` rules) that the LLM may need multiple attempts to satisfy, increasing `max_attempts` gives the LLM more opportunities to self-correct.
+    *   **Trade-off:** More attempts mean higher latency and token usage if validation keeps failing. If your schema consistently fails after 3 attempts, consider simplifying the validation logic or improving the prompt rather than just increasing retries.
+
 #### Controlling Schema Generation for Gemini Models
 
 When using Gemini models, `trustcall` internally transforms Pydantic schemas to be more compatible with Google's API client library. This involves a choice between two strategies for handling nested or recursive model definitions.

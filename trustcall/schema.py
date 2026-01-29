@@ -465,11 +465,11 @@ def _ensure_patches(args: dict) -> list[Dict[str, Any]]:
                     patch = patch.model_dump() if hasattr(patch, 'model_dump') else patch.dict()
                 op = patch.get("op")
                 path = patch.get("path")
-                value = patch.get("value")
                 if op and path:
                     if op == "remove":
                         processed_patches.append({"op": op, "path": path})
-                    elif value is not None:
+                    elif "value" in patch:  # Check for key presence, not truthiness (allows null values per RFC 6902)
+                        value = patch.get("value")
                         parsed_value = value
                         if isinstance(value, str):
                             stripped_value = value.strip()
