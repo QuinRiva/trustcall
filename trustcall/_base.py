@@ -7,6 +7,7 @@ for users.
 
 # Re-export key functionality
 from trustcall.extract import (
+    AttemptInfo,
     create_extractor,
 )
 from trustcall.states import (
@@ -25,6 +26,7 @@ PatchDoc = _create_patch_doc_schema(for_gemini=False)
 PatchFunctionErrors = _create_patch_function_errors_schema(for_gemini=False)
 
 __all__ = [
+    "AttemptInfo",
     "create_extractor",
     "ensure_tools",
     "ExtractionInputs",

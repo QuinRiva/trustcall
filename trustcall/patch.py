@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Literal,
     Sequence,
     Union,
     Optional,
+    TYPE_CHECKING,
     cast,
-    
 )
+
+if TYPE_CHECKING:
+    from trustcall.extract import AttemptInfo
 
 import jsonpatch  # type: ignore[import-untyped]
 import jsonpointer  # type: ignore[import-untyped]
@@ -47,17 +51,21 @@ class _Patch:
     """
 
     def __init__(
-        self, llm: BaseChatModel, valid_tool_names: Optional[List[str]] = None
+        self,
+        llm: BaseChatModel,
+        valid_tool_names: Optional[List[str]] = None,
+        on_attempt: Optional[Callable[["AttemptInfo"], None]] = None,
     ):
         # Get the appropriate patching tools based on LLM type
         using_gemini = is_gemini_model(llm)
         self.bound = llm.bind_tools(
             [
-                _create_patch_function_errors_schema(using_gemini), 
+                _create_patch_function_errors_schema(using_gemini),
                 _create_patch_function_name_schema(valid_tool_names, using_gemini)
                 ],
             tool_choice="any",
         )
+        self.on_attempt = on_attempt
 
     @ls.traceable(tags=["patch", "langsmith:hidden"])
     def _tear_down(
@@ -92,20 +100,54 @@ class _Patch:
             # (This matches the logic in handle_retries where bump_attempt is True for the first error found)
             return target_id, bool(target_id)
 
+    def _find_original_ai_message(self, messages: List[AnyMessage]) -> Optional[AIMessage]:
+        """Find the original AI message that contains the tool call being patched."""
+        for m in reversed(messages):
+            if isinstance(m, AIMessage):
+                return m
+        return None
+
+    def _fire_callback_on_failure(
+        self,
+        state: Any,
+        error_msg: str,
+    ) -> None:
+        """Fire the on_attempt callback with the raw AI message when patching fails."""
+        if not self.on_attempt:
+            return
+        
+        original_ai_message = self._find_original_ai_message(state.messages)
+        if not original_ai_message:
+            return
+        
+        # Import here to avoid circular import at module level
+        from trustcall.extract import AttemptInfo
+        
+        self.on_attempt(AttemptInfo(
+            attempt_number=getattr(state, 'attempts', 0) + 1,
+            ai_message=original_ai_message,
+            validation_errors=[error_msg],
+            is_success=False,
+        ))
+
     async def ainvoke(
         self, state: Any, config: RunnableConfig
-    ) -> Command[Literal["sync", "__end__"]]:
-        """Generate a JSONPatch to correct the validation error and heal the tool call."""
-        # --- Get target_id and bump_attempt safely ---
+    ) -> Command[Literal["sync"]]:
+        """Generate a JSONPatch to correct the validation error and heal the tool call.
+        
+        If the patch LLM fails (exception or no target_id), we fire the on_attempt
+        callback with the raw AI message, increment attempts, and continue to
+        sync → validate. The original error ToolMessages remain in state, so
+        handle_retries will see the errors and either retry or end based on max_attempts.
+        """
         target_id, bump_attempt = self._get_target_id_and_bump(state)
         if not target_id:
-             logger.error("_Patch ainvoke could not find target_id from messages.")
-             return Command(goto="__end__") # Cannot proceed without target_id
-        # --- END Get target_id ---
+            logger.error("_Patch ainvoke could not find target_id from messages.")
+            return Command(
+                update={"attempts": 1 if bump_attempt else 0},
+                goto=("sync",),
+            )
 
-        # Determine which messages to use for the LLM prompt.
-        # The specialized prompt is passed via context to avoid breaking the
-        # main message history, which is needed for state cleanup.
         messages_for_llm = (
             state.validation_context.get("__messages_for_fixing")
             if hasattr(state, "validation_context") and state.validation_context
@@ -113,34 +155,50 @@ class _Patch:
         )
 
         try:
-            # Pass only the messages to the LLM
             msg = await self.bound.ainvoke(messages_for_llm, config)
         except Exception as e:
             logger.error(f"_Patch ainvoke LLM call failed: {e}")
-            return Command(goto="__end__")
-            
-        return Command(
-            update=self._tear_down(
+            self._fire_callback_on_failure(state, f"Patch LLM call failed: {e}")
+            return Command(
+                update={"attempts": 1 if bump_attempt else 0},
+                goto=("sync",),
+            )
+
+        try:
+            result = self._tear_down(
                 cast(AIMessage, msg),
-                state.messages, # Always use the full history for teardown
-                target_id, # Use extracted target_id
-                bump_attempt, # Use extracted bump_attempt
-            ),
-            goto=("sync",),
-        )
+                state.messages,
+                target_id,
+                bump_attempt,
+            )
+        except Exception as e:
+            logger.error(f"_Patch ainvoke _tear_down failed: {e}")
+            self._fire_callback_on_failure(state, f"Patch application failed: {e}")
+            return Command(
+                update={"attempts": 1 if bump_attempt else 0},
+                goto=("sync",),
+            )
+
+        return Command(update=result, goto=("sync",))
 
     def invoke(
         self, state: Any, config: RunnableConfig
-    ) -> Command[Literal["sync", "__end__"]]:
-        """Generate a JSONPatch to correct the validation error and heal the tool call."""
-         # --- Get target_id and bump_attempt safely ---
+    ) -> Command[Literal["sync"]]:
+        """Generate a JSONPatch to correct the validation error and heal the tool call.
+        
+        If the patch LLM fails (exception or no target_id), we fire the on_attempt
+        callback with the raw AI message, increment attempts, and continue to
+        sync → validate. The original error ToolMessages remain in state, so
+        handle_retries will see the errors and either retry or end based on max_attempts.
+        """
         target_id, bump_attempt = self._get_target_id_and_bump(state)
         if not target_id:
-             logger.error("_Patch invoke could not find target_id from messages.")
-             return Command(goto="__end__") # Cannot proceed without target_id
-        # --- END Get target_id ---
+            logger.error("_Patch invoke could not find target_id from messages.")
+            return Command(
+                update={"attempts": 1 if bump_attempt else 0},
+                goto=("sync",),
+            )
 
-        # Determine which messages to use for the LLM prompt.
         messages_for_llm = (
             state.validation_context.get("__messages_for_fixing")
             if hasattr(state, "validation_context") and state.validation_context
@@ -148,21 +206,31 @@ class _Patch:
         )
 
         try:
-             # Pass only the messages to the LLM
             msg = self.bound.invoke(messages_for_llm, config)
         except Exception as e:
             logger.error(f"_Patch invoke LLM call failed: {e}")
-            return Command(goto="__end__")
-            
-        return Command(
-            update=self._tear_down(
+            self._fire_callback_on_failure(state, f"Patch LLM call failed: {e}")
+            return Command(
+                update={"attempts": 1 if bump_attempt else 0},
+                goto=("sync",),
+            )
+
+        try:
+            result = self._tear_down(
                 cast(AIMessage, msg),
-                state.messages, # Always use the full history for teardown
-                target_id, # Use extracted target_id
-                bump_attempt, # Use extracted bump_attempt
-            ),
-            goto=("sync",),
-        )
+                state.messages,
+                target_id,
+                bump_attempt,
+            )
+        except Exception as e:
+            logger.error(f"_Patch invoke _tear_down failed: {e}")
+            self._fire_callback_on_failure(state, f"Patch application failed: {e}")
+            return Command(
+                update={"attempts": 1 if bump_attempt else 0},
+                goto=("sync",),
+            )
+
+        return Command(update=result, goto=("sync",))
 
     def as_runnable(self):
         return RunnableCallable(self.invoke, self.ainvoke, name="patch", trace=False)
@@ -204,15 +272,8 @@ def _get_message_op(
                                         },
                                     })
                         except Exception as e:
-                           # Enhanced logging for patch application failure
                            logger.error(f"Error applying patch for target_id '{target_id}'. Exception: {repr(e)}", exc_info=True)
-                           logger.error(f"  Original Tool Call Args (tool_call['args'] which contains patches): {tool_call.get('args')}")
-                           # Log processed patches if available
-                           try:
-                               processed_patches = _ensure_patches(tool_call.get('args', {}))
-                            #    logger.error(f"  Processed Patches from tool_call['args']: {processed_patches}")
-                           except Exception as ensure_e:
-                               logger.error(f"  Error during _ensure_patches call: {repr(ensure_e)}")
+                           raise
                     else:
                        logger.error(f"Unrecognized function call {tool_call_name}")
         

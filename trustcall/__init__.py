@@ -5,12 +5,13 @@ validate, and correct structured outputs from language models. It supports
 patch-based extraction for efficient and accurate updates to existing schemas.
 """
 
-from trustcall._base import ExtractionInputs, ExtractionOutputs, create_extractor
+from trustcall._base import AttemptInfo, ExtractionInputs, ExtractionOutputs, create_extractor
 from trustcall.utils import _patch_vertexai_for_gemini_ref
 
 _patch_vertexai_for_gemini_ref()
 
 __all__ = [
+    "AttemptInfo",
     "create_extractor",
     "ExtractionInputs",
     "ExtractionOutputs",

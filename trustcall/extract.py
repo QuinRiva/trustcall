@@ -7,7 +7,7 @@ import json
 import logging
 import operator
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import (
     Any,
     Callable,
@@ -66,6 +66,20 @@ from trustcall.states import ExtractionState, ExtendedExtractState, DeletionStat
 logger = logging.getLogger("extraction")
 
 DEFAULT_MAX_ATTEMPTS = 3
+
+
+@dataclass
+class AttemptInfo:
+    """Information about an LLM extraction attempt, exposed via on_attempt callback.
+    
+    This provides observability into each LLM invocation during extraction,
+    including failed attempts that trigger retries.
+    """
+    attempt_number: int
+    ai_message: AIMessage
+    validation_errors: Optional[List[str]]
+    is_success: bool
+
 
 class _Extract:
     def __init__(
@@ -561,6 +575,7 @@ def create_extractor(
     existing_schema_policy: bool | Literal["ignore"] = True,
     gemini_ref_strategy: Literal["inline", "intelligent"] = "inline",
     gemini_schema_recursion_depth: Optional[int] = None,
+    on_attempt: Optional[Callable[[AttemptInfo], None]] = None,
 ) -> Runnable[InputsLike, ExtractionOutputs]:
     """Create an extractor that generates validated structured outputs using an LLM.
 
@@ -595,6 +610,11 @@ def create_extractor(
         gemini_schema_recursion_depth (Optional[int]): The maximum recursion depth
             for inlining schema definitions when using the 'inline' strategy with
             Gemini models. (default: 5)
+        on_attempt (Optional[Callable[[AttemptInfo], None]]): Callback invoked after
+            each LLM extraction attempt, providing observability into retry behavior.
+            Called with AttemptInfo containing: attempt_number, ai_message,
+            validation_errors (list of error strings or None), and is_success flag.
+            Useful for logging raw LLM responses when validation fails. (default: None)
 
     Returns:
         Runnable[ExtractionInputs, ExtractionOutputs]: A runnable that
@@ -797,7 +817,7 @@ def create_extractor(
         gemini_schema_recursion_depth=gemini_schema_recursion_depth,
     )
     builder.add_node(updater.as_runnable())
-    builder.add_node(_Patch(llm, valid_tool_names=tool_names).as_runnable())
+    builder.add_node(_Patch(llm, valid_tool_names=tool_names, on_attempt=on_attempt).as_runnable())
     builder.add_node("validate", validator)
 
     def generate_missing_tool_node(state: ExtractionState) -> dict:
@@ -913,9 +933,7 @@ def create_extractor(
     def handle_retries(state: ExtractionState, config: RunnableConfig) -> Union[Literal["__end__"], list]:
         """After validation, decide whether to retry or end the process."""
         max_attempts = config["configurable"].get("max_attempts", DEFAULT_MAX_ATTEMPTS)
-        if state.attempts >= max_attempts:
-            return "__end__"
-
+        
         # Defensive check for AIMessage
         if not any(isinstance(m, AIMessage) for m in state.messages):
             logger.warning("No AIMessage found in state.messages, ending processing")
@@ -936,10 +954,36 @@ def create_extractor(
         # Check if any of the relevant tool messages are errors
         has_errors = any(m.additional_kwargs.get("is_error") for m in relevant_tool_messages)
         
+        # Get the AIMessage for callback
+        ai_message = state.messages[last_ai_message_index] if last_ai_message_index >= 0 else None
+        
+        # Max attempts exhausted - fire callback if we still have errors
+        if state.attempts >= max_attempts:
+            if has_errors and on_attempt and ai_message:
+                validation_errors = [
+                    str(m.content) for m in relevant_tool_messages
+                    if m.additional_kwargs.get("is_error")
+                ]
+                on_attempt(AttemptInfo(
+                    attempt_number=state.attempts,
+                    ai_message=ai_message,
+                    validation_errors=validation_errors,
+                    is_success=False,
+                ))
+            return "__end__"
+        
         if not has_errors:
+            # Success case - fire callback if provided
+            if on_attempt and ai_message:
+                on_attempt(AttemptInfo(
+                    attempt_number=state.attempts,
+                    ai_message=ai_message,
+                    validation_errors=None,
+                    is_success=True,
+                ))
             return "__end__"
 
-        # If we are here, it means there are errors, so we proceed with retry logic.
+        # Proceed with retry logic - callback is fired from _Patch when patching fails
         to_send = []
         bumped = False
         
