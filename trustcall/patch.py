@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import asdict, dataclass
 from typing import (
     Any,
     Callable,
@@ -31,12 +30,11 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
-from langgraph.constants import Send
 from langgraph.types import Command
 from langgraph.utils.runnable import RunnableCallable
 
 from trustcall.schema import _ensure_patches, _create_patch_function_errors_schema, _create_patch_function_name_schema
-from trustcall.states import ExtractionState, ExtendedExtractState, MessageOp
+from trustcall.states import ExtractionState, MessageOp
 from trustcall.utils import is_gemini_model
 from langchain_core.language_models import BaseChatModel
 
@@ -74,17 +72,19 @@ class _Patch:
         messages: List[AnyMessage],
         target_id: str,
         bump_attempt: bool,
-    ):
+    ) -> tuple[dict, List[str]]:
         if not msg.id:
             msg.id = str(uuid.uuid4())
-        # We will directly update the messages in the state before validation.
-        msg_ops = _infer_patch_message_ops(messages, msg, target_id)
-        return {
-            "messages": msg_ops,
-            "attempts": 1 if bump_attempt else 0,
-        }
+        msg_ops, patch_errors = _infer_patch_message_ops(messages, msg, target_id)
+        return (
+            {
+                "messages": msg_ops,
+                "attempts": 1 if bump_attempt else 0,
+            },
+            patch_errors,
+        )
 
-    def _get_target_id_and_bump(self, state: ExtractionState) -> tuple[Optional[str], bool]:
+    def _get_target_id_and_bump(self, state: Any) -> tuple[Optional[str], bool]:
         """Extract target tool_call_id and bump_attempt flag from state or messages."""
         if hasattr(state, "tool_call_id") and state.tool_call_id:
             # If ExtendedExtractState is somehow passed correctly, use its values
@@ -110,7 +110,7 @@ class _Patch:
     def _fire_callback_on_failure(
         self,
         state: Any,
-        error_msg: str,
+        error_msg: str | List[str],
     ) -> None:
         """Fire the on_attempt callback with the raw AI message when patching fails."""
         if not self.on_attempt:
@@ -122,11 +122,13 @@ class _Patch:
         
         # Import here to avoid circular import at module level
         from trustcall.extract import AttemptInfo
+
+        validation_errors = [error_msg] if isinstance(error_msg, str) else error_msg
         
         self.on_attempt(AttemptInfo(
             attempt_number=getattr(state, 'attempts', 0) + 1,
             ai_message=original_ai_message,
-            validation_errors=[error_msg],
+            validation_errors=validation_errors,
             is_success=False,
         ))
 
@@ -151,8 +153,8 @@ class _Patch:
         messages_for_llm = (
             state.validation_context.get("__messages_for_fixing")
             if hasattr(state, "validation_context") and state.validation_context
-            else state.messages
-        )
+            else None
+        ) or state.messages
 
         try:
             msg = await self.bound.ainvoke(messages_for_llm, config)
@@ -165,7 +167,7 @@ class _Patch:
             )
 
         try:
-            result = self._tear_down(
+            result, patch_errors = self._tear_down(
                 cast(AIMessage, msg),
                 state.messages,
                 target_id,
@@ -178,6 +180,9 @@ class _Patch:
                 update={"attempts": 1 if bump_attempt else 0},
                 goto=("sync",),
             )
+
+        if patch_errors:
+            self._fire_callback_on_failure(state, patch_errors)
 
         return Command(update=result, goto=("sync",))
 
@@ -202,8 +207,8 @@ class _Patch:
         messages_for_llm = (
             state.validation_context.get("__messages_for_fixing")
             if hasattr(state, "validation_context") and state.validation_context
-            else state.messages
-        )
+            else None
+        ) or state.messages
 
         try:
             msg = self.bound.invoke(messages_for_llm, config)
@@ -216,7 +221,7 @@ class _Patch:
             )
 
         try:
-            result = self._tear_down(
+            result, patch_errors = self._tear_down(
                 cast(AIMessage, msg),
                 state.messages,
                 target_id,
@@ -230,6 +235,9 @@ class _Patch:
                 goto=("sync",),
             )
 
+        if patch_errors:
+            self._fire_callback_on_failure(state, patch_errors)
+
         return Command(update=result, goto=("sync",))
 
     def as_runnable(self):
@@ -238,8 +246,9 @@ class _Patch:
 
 def _get_message_op(
     messages: Sequence[AnyMessage], tool_call: dict, tool_call_name: str, target_id: str
-) -> List[MessageOp]:
+) -> tuple[List[MessageOp], List[str]]:
     msg_ops: List[MessageOp] = []
+    patch_errors: List[str] = []
     
     # Process each message
     for m in messages:
@@ -272,8 +281,18 @@ def _get_message_op(
                                         },
                                     })
                         except Exception as e:
-                           logger.error(f"Error applying patch for target_id '{target_id}'. Exception: {repr(e)}", exc_info=True)
-                           raise
+                           # Log but do NOT re-raise. Continuing allows ToolMessage
+                           # delete ops to be generated below, which is critical for
+                           # breaking the validate_or_repatch → patch loop. The
+                           # un-patched tool call args remain unchanged; the next
+                           # validation pass will catch them and retry properly
+                           # through handle_retries (which has attempt guards).
+                           error_msg = (
+                               f"Error applying patch for target_id '{target_id}'. "
+                               f"Exception: {repr(e)}"
+                           )
+                           logger.error(error_msg)
+                           patch_errors.append(error_msg)
                     else:
                        logger.error(f"Unrecognized function call {tool_call_name}")
         
@@ -281,7 +300,7 @@ def _get_message_op(
         if isinstance(m, ToolMessage) and m.tool_call_id == target_id:
             msg_ops.append(MessageOp(op="delete", target=m.id or ""))
     
-    return msg_ops
+    return msg_ops, patch_errors
 
 
 @ls.traceable(tags=["langsmith:hidden"])
@@ -289,15 +308,16 @@ def _infer_patch_message_ops(
     messages: Sequence[AnyMessage],
     msg_with_patches: AIMessage,
     target_id: str,
-):
+) -> tuple[List[MessageOp], List[str]]:
     """Create all message operations based on the patch LLM call."""
-    ops = [
-        op
-        for tool_call in msg_with_patches.tool_calls
-        for op in _get_message_op(
+    ops: List[MessageOp] = []
+    patch_errors: List[str] = []
+    for tool_call in msg_with_patches.tool_calls:
+        tool_ops, tool_errors = _get_message_op(
             messages, tool_call["args"], tool_call["name"], target_id=target_id
         )
-    ]
+        ops.extend(tool_ops)
+        patch_errors.extend(tool_errors)
     
     # Add an operation to update the usage metadata of the original AI message
     if msg_with_patches.usage_metadata:
@@ -318,11 +338,11 @@ def _infer_patch_message_ops(
                 },
             })
 
-    return ops
+    return ops, patch_errors
 
 def _fix_string_concat(
-    doc: dict, patch: list[jsonpatch.JsonPatch]
-) -> Optional[list[jsonpatch.JsonPatch]] | None:
+    doc: dict, patch: list[Dict[str, Any]]
+) -> list[Dict[str, Any]] | None:
     fixed = False
     result = []
     for p in patch:
@@ -350,7 +370,7 @@ def _fix_string_concat(
         return None
     return result
 
-def _apply_patch(doc: dict, patches: list[jsonpatch.JsonPatch]) -> dict:
+def _apply_patch(doc: dict, patches: list[Dict[str, Any]]) -> dict:
     try:
         return jsonpatch.apply_patch(doc, patches)
     except jsonpatch.JsonPatchConflict:

@@ -212,11 +212,6 @@ def _get_schema(
 
 # JSON Patch related classes
 
-_JSON_PRIM_TYPES = Union[str, StrictInt, StrictBool, StrictFloat, None]
-_JSON_TYPES = Union[
-    _JSON_PRIM_TYPES, List[_JSON_PRIM_TYPES], Dict[str, _JSON_PRIM_TYPES]
-]
-
 
 class BasePatch(BaseModel):
     """Base class for all patch types."""
@@ -240,11 +235,17 @@ class FullPatch(BasePatch):
     """A JSON Patch document represents an operation to be performed on a JSON document.
 
     Note that the op and path are ALWAYS required. Value is required for ALL operations except 'remove'.
-    This supports OpenAI and other LLMs with full JSON support (not Gemini).
+
+    The value field accepts any valid JSON structure (primitives, objects, arrays,
+    nested to any depth). Structural validation of the value happens when the
+    patched document is re-validated against the target Pydantic schema — the
+    patch itself is just a transport container.
     """ # noqa
-    value: Union[_JSON_TYPES, List[_JSON_TYPES], Dict[str, _JSON_TYPES]] = Field(
+    value: Any = Field(
         ...,
-        description="The value to be used within the operation."
+        description="The value to be used within the operation. "
+        "Can be any valid JSON value: string, number, boolean, null, object, or array "
+        "(nested to any depth)."
     )
     model_config = ConfigDict(
         json_schema_extra={

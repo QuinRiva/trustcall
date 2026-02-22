@@ -753,28 +753,42 @@ def create_extractor(
         _patch_vertexai_for_gemini_ref()
 
     # Define error formatting
+    # TODO: Need to better evaluate if this all required in the standard template
     def format_exception(error: BaseException, call: ToolCall, schema: Type[BaseModel]) -> str:
         return (
             "**IMPORTANT: This validation error is a SYMPTOM, not the root cause.**\n\n"
             "Before patching, ask yourself: *What did I generate that caused this validation to fail?*\n"
+            "This error was caused by YOUR previous tool call output, not by the user.\n\n"
             "Common root causes:\n"
             "- Returned an empty object `{}` when the schema required specific fields\n"
             "- Omitted a required nested structure entirely\n"
             "- Used wrong data types (string instead of object, etc.)\n"
             "- Misunderstood the schema structure\n\n"
-            "The patch you create should address the ROOT CAUSE, not just silence the error.\n\n"
+            "The patch you create should address the ROOT CAUSE, not just silence the error.\n"
+            "**DO NOT** copy-paste from your internal reasoning — construct the complete value directly.\n\n"
             "---\n\n"
             f"**Validation Error:**\n\n```\n{str(error)}\n```\n\n"
             "**Expected Parameter Schema:**\n\n"
             f"```json\n{_get_schema(schema, using_gemini, gemini_ref_strategy=gemini_ref_strategy, gemini_schema_recursion_depth=gemini_schema_recursion_depth)}\n```\n\n"
-            "**JSONPatch Operation Guide:**\n"
-            "- `input_value={}` (empty object): You returned an empty object where fields were required. "
-            "The path to those fields DOES NOT EXIST yet. Use `\"op\": \"add\"` to create them.\n"
-            "- `Field required [type=missing]` with non-empty parent: A sibling field exists but this one is missing. "
-            "Use `\"op\": \"add\"` to add the missing field.\n"
-            "- Wrong value type or validation failed on an existing field: The path EXISTS but has wrong content. "
-            "Use `\"op\": \"replace\"` to fix it.\n"
-            "- **CRITICAL**: `replace` FAILS SILENTLY if the path doesn't exist! When in doubt, use `add`.\n\n"
+            "**JSONPatch Operation Guide:**\n\n"
+            "**1. Empty object (`input_value={}`):**\n"
+            "You returned `{}` where the schema required specific fields. "
+            "The fields DOES NOT EXIST yet — you must `add` the COMPLETE object in a single atomic patch.\n\n"
+            "WRONG (empty placeholder):\n"
+            '```json\n{"op": "add", "path": "/items/-", "value": {}}\n```\n\n'
+            "RIGHT (complete object with all required fields):\n"
+            '```json\n{"op": "add", "path": "/items/-", "value": {"name": "...", "active": true, "reason": "..."}}\n```\n\n'
+            "**2. `add` operations are ATOMIC:**\n"
+            "Each `add` must deliver a COMPLETE, self-contained value. "
+            "Do NOT use placeholder values (`{}`, `[]`, `\"\"`) intending to fill them in with subsequent patches.\n\n"
+            "**3. Missing sibling field (`Field required [type=missing]`):**\n"
+            "A sibling field exists but this one is missing. "
+            "Use `\"op\": \"add\"` to add the missing field.\n\n"
+            "**4. Wrong value or type on existing field:**\n"
+            "The path EXISTS but has wrong content. "
+            "Use `\"op\": \"replace\"` to fix it.\n\n"
+            "**5. CRITICAL — `replace` vs `add`:**\n"
+            "`replace` FAILS SILENTLY if the path doesn't exist. When in doubt, use `add`.\n\n"
             f"Use PatchFunctionErrors to fix all validation errors for json_doc_id=[{call['id']}]."
         )
     
@@ -1057,9 +1071,15 @@ def create_extractor(
 
     def validate_or_repatch(
         state: ExtractionState,
-    ) -> Literal["validate", "patch"]:
+        config: RunnableConfig,
+    ) -> Literal["validate", "patch", "__end__"]:
+        max_attempts = config["configurable"].get("max_attempts", DEFAULT_MAX_ATTEMPTS)
         if state.messages[-1].type == "ai":
+            # Always validate after a patch, even at max attempts.
+            # handle_retries will enforce the attempt cap after validation.
             return "validate"
+        if state.attempts >= max_attempts:
+            return "__end__"
         return "patch"
 
     builder.add_node(sync)
