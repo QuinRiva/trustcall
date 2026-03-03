@@ -56,12 +56,24 @@ class _Patch:
     ):
         # Get the appropriate patching tools based on LLM type
         using_gemini = is_gemini_model(llm)
+        
+        bind_kwargs = {}
+        # IMPORTANT: Do not use tool_choice="any" for Gemini.
+        # Gemini 3.1 Pro Preview has an undocumented backend bug where forcing
+        # tool_config.mode="ANY" combined with untyped schema fields (like
+        # `value: Any` in FullPatch) causes the model's structural JSON generation
+        # to degrade, defaulting to scalars like `-1` or `None` instead of complex
+        # lists/dicts. By omitting tool_choice (falling back to "AUTO"), Gemini
+        # correctly hallucinates and generates the untyped JSON structures natively.
+        if not using_gemini:
+            bind_kwargs["tool_choice"] = "any"
+
         self.bound = llm.bind_tools(
             [
                 _create_patch_function_errors_schema(using_gemini),
                 _create_patch_function_name_schema(valid_tool_names, using_gemini)
-                ],
-            tool_choice="any",
+            ],
+            **bind_kwargs
         )
         self.on_attempt = on_attempt
 

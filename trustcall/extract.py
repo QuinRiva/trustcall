@@ -967,7 +967,7 @@ def create_extractor(
 
         # Check if any of the relevant tool messages are errors
         has_errors = any(m.additional_kwargs.get("is_error") for m in relevant_tool_messages)
-        
+
         # Get the AIMessage for callback
         ai_message = state.messages[last_ai_message_index] if last_ai_message_index >= 0 else None
         
