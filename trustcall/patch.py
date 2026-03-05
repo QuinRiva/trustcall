@@ -390,3 +390,45 @@ def _apply_patch(doc: dict, patches: list[Dict[str, Any]]) -> dict:
         if fixed is not None:
             return jsonpatch.apply_patch(doc, fixed)
         raise
+    # NOTE: Non-atomic (individual) patch fallback is intentionally NOT implemented.
+    #
+    # Rationale (PE-1187): For array-heavy schemas (e.g. LLMBatchExtractionOutput.extractions),
+    # a patch bundle often mixes structural ops (add/remove on array indices) with
+    # leaf-value fixes (replace on nested fields). If a structural op fails and is
+    # skipped, subsequent index-based patches apply against shifted positions,
+    # producing silently corrupted state. Since each patch retry is stateless (the
+    # LLM has no memory of prior attempts), it cannot compensate for the drift.
+    #
+    # Keeping patching atomic means: either the full bundle applies against one
+    # consistent baseline, or nothing changes and the next retry sees the same
+    # stable state. The caller (_get_message_op) already catches exceptions and
+    # appends them to patch_errors, so a failed atomic apply does not crash the
+    # graph — it just skips the update_tool_call op for that target.
+    #
+    # Future path forward (PE-1187): Implement a "safe partial" mode that only
+    # falls back to individual application when ALL patches in the bundle are
+    # replace-only on non-overlapping leaf paths (no add/remove, no array-index
+    # ops). This would safely handle the common case (fixing N independent field
+    # values) without risking index drift on structural changes.
+    #
+    # --- Commented-out non-atomic fallback for reference ---
+    # except (jsonpointer.JsonPointerException, jsonpatch.JsonPatchException, Exception) as e:
+    #     logger.warning(
+    #         f"[_apply_patch] Atomic patch application failed: {e}. "
+    #         f"Falling back to individual patch application for {len(patches)} patches."
+    #     )
+    #     result = dict(doc)
+    #     applied_count = 0
+    #     for i, patch in enumerate(patches):
+    #         try:
+    #             result = jsonpatch.apply_patch(result, [patch])
+    #             applied_count += 1
+    #         except Exception as patch_err:
+    #             logger.warning(
+    #                 f"[_apply_patch] Skipping patch {i} (op={patch.get('op')}, "
+    #                 f"path={patch.get('path')}): {patch_err}"
+    #             )
+    #     logger.warning(
+    #         f"[_apply_patch] Applied {applied_count}/{len(patches)} patches individually."
+    #     )
+    #     return result

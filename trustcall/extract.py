@@ -755,6 +755,29 @@ def create_extractor(
     # Define error formatting
     # TODO: Need to better evaluate if this all required in the standard template
     def format_exception(error: BaseException, call: ToolCall, schema: Type[BaseModel]) -> str:
+        error_details = str(error)
+        if hasattr(error, "errors") and callable(getattr(error, "errors")):
+            try:
+                err_list = error.errors()
+                formatted_errs = []
+                for err in err_list:
+                    # 'loc' is a tuple of path components. E.g. ('extractions', 0, 'tenant_classification')
+                    # If loc is empty, or just root level (e.g. __root__), we should still show it but make it clear.
+                    loc_tuple = err.get("loc", ())
+                    
+                    if not loc_tuple or loc_tuple == ('__root__',):
+                        # This is a model-level validation error, not tied to a specific field path.
+                        path_str = "N/A (Root Level Validation Error - affects the entire object)"
+                    else:
+                        path_str = "/" + "/".join(str(x) for x in loc_tuple)
+                        
+                    formatted_errs.append(f"JSON Pointer Path: {path_str}\nError Message: {err.get('msg')}")
+                    
+                if formatted_errs:
+                    error_details = "Structured Errors (use these JSON Pointer paths for your patches!):\n" + "\n\n".join(formatted_errs) + "\n\n---\nRaw Error Output:\n" + error_details
+            except Exception:
+                pass
+
         return (
             "**IMPORTANT: This validation error is a SYMPTOM, not the root cause.**\n\n"
             "Before patching, ask yourself: *What did I generate that caused this validation to fail?*\n"
@@ -767,7 +790,7 @@ def create_extractor(
             "The patch you create should address the ROOT CAUSE, not just silence the error.\n"
             "**DO NOT** copy-paste from your internal reasoning — construct the complete value directly.\n\n"
             "---\n\n"
-            f"**Validation Error:**\n\n```\n{str(error)}\n```\n\n"
+            f"**Validation Error:**\n\n```\n{error_details}\n```\n\n"
             "**Expected Parameter Schema:**\n\n"
             f"```json\n{_get_schema(schema, using_gemini, gemini_ref_strategy=gemini_ref_strategy, gemini_schema_recursion_depth=gemini_schema_recursion_depth)}\n```\n\n"
             "**JSONPatch Operation Guide:**\n\n"
