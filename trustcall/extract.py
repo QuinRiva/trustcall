@@ -189,7 +189,19 @@ class _ExtractUpdates:
             ]
             new_tools.extend(tools_)
             tool_choice = "any"
-            
+
+        # IMPORTANT: Do not force tool_choice for Gemini.
+        # Gemini has an undocumented backend bug where forcing
+        # tool_config.mode="ANY" (triggered by BOTH tool_choice="any" AND
+        # tool_choice="<specific_tool_name>") combined with untyped schema
+        # fields (like `value: Any` in FullPatch/PatchDoc) causes the model
+        # to degrade, producing scalars (e.g. 6983, 20140415000000) instead
+        # of the intended dict/list objects. By omitting tool_choice (falling
+        # back to "AUTO"), Gemini generates untyped JSON structures correctly.
+        # See _Patch.__init__ for the same workaround.
+        if using_gemini:
+            tool_choice = None
+
         self.enable_inserts = enable_inserts
         self.enable_updates = enable_updates
         self.bound_tools = new_tools
@@ -279,6 +291,7 @@ class _ExtractUpdates:
     ):
         resolved_tool_calls = []
         updated_docs = {}
+        all_dropped_patches = []
         
          # Try to get trace ID from langfuse if available, otherwise continue without it
         try:
@@ -330,7 +343,7 @@ class _ExtractUpdates:
                 if target:
                     try:
                         from trustcall.schema import _ensure_patches
-                        patches = _ensure_patches(tc["args"])
+                        patches, dropped = _ensure_patches(tc["args"])
                         if patches or self.tool_choice == "PatchDoc":
                             # The second condition is so that, when we are continuously
                             # updating a single doc, we will still include it in
@@ -344,6 +357,8 @@ class _ExtractUpdates:
                                 )
                             )
                             updated_docs[tc["id"]] = str(json_doc_id)
+                            if dropped:
+                                all_dropped_patches.extend(dropped)
                     except Exception as e:
                         logger.error(f"Could not apply patch: {e}")
                         if rt:
@@ -360,7 +375,7 @@ class _ExtractUpdates:
             id=msg.id,
             usage_metadata=msg.usage_metadata,
             response_metadata=msg.response_metadata,
-            additional_kwargs={"updated_docs": updated_docs},
+            additional_kwargs={"updated_docs": updated_docs, "dropped_patches": all_dropped_patches},
         )
         if not ai_message.id:
             ai_message.id = str(uuid.uuid4())
@@ -1209,12 +1224,16 @@ def create_extractor(
             if "output_tokens" not in msg.usage_metadata and "total_tokens" in msg.usage_metadata and "input_tokens" in msg.usage_metadata:
                 msg.usage_metadata["output_tokens"] = msg.usage_metadata["total_tokens"] - msg.usage_metadata["input_tokens"]
         
-        return {
+        result = {
             "messages": [msg],
             "responses": responses,
             "response_metadata": response_metadata,
             "attempts": state["attempts"],
         }
+        dropped_patches = msg.additional_kwargs.get("dropped_patches", [])
+        if dropped_patches:
+            result["dropped_patches"] = dropped_patches
+        return result
 
     def coerce_inputs(state: InputsLike) -> Union[ExtractionInputs, dict]:
         """Coerce inputs to the expected format."""

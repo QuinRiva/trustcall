@@ -281,7 +281,9 @@ def _get_message_op(
                     # Handle any patch function - cover all cases using name check instead of type check
                     elif "PatchFunctionErrors" in tool_call_name or tool_call_name == "PatchDoc":
                         try:
-                            patches = _ensure_patches(tool_call)
+                            patches, dropped = _ensure_patches(tool_call)
+                            if dropped:
+                                logger.warning(f"Dropped {len(dropped)} patch(es) with invalid paths during retry for target_id '{target_id}'")
                             if patches:
                                 patched_args = _apply_patch(tc["args"], patches) # Use local _apply_patch
                                 msg_ops.append({

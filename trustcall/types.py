@@ -82,11 +82,16 @@ class ExtractionInputs(TypedDict, total=False):
 InputsLike = Union[ExtractionInputs, List[AnyMessage], PromptValue, str]
 
 
-class ExtractionOutputs(TypedDict):
+class ExtractionOutputs(TypedDict, total=False):
     messages: List[Any]  # AIMessage
     responses: List[Any]  # BaseModel
     response_metadata: List[dict[str, Any]]
     attempts: int
+    dropped_patches: List[dict[str, Any]]
+    """Patches that were dropped due to invalid JSON Pointer paths (e.g. garbled
+    LLM output). Non-empty list signals partial patch application — some data
+    the LLM intended to write was lost. Callers should check this to detect
+    partial updates."""
 
 
 Message = Union[AnyMessage, MessageLikeRepresentation]

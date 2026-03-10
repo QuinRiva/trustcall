@@ -455,11 +455,19 @@ def _create_remove_doc_schema(allowed_ids: tuple[str]) -> Type[BaseModel]:
     RemoveDoc.__name__ = "RemoveDoc"
     return RemoveDoc
 
-def _ensure_patches(args: dict) -> list[Dict[str, Any]]:
-    """Process patches from different formats and ensure they're valid JsonPatch objects."""
+def _ensure_patches(args: dict) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+    """Process patches from different formats and ensure they're valid JsonPatch objects.
+
+    Returns:
+        Tuple of (valid_patches, dropped_patches). Dropped patches are those with
+        invalid JSON Pointer paths (LLM garbling). Callers MUST check dropped_patches
+        to detect partial application — trustcall's contract requires explicit
+        signalling when patches are lost.
+    """
     patches = args.get("patches", [])
     if isinstance(patches, list):
         processed_patches = []
+        dropped_patches = []
         for patch in patches:
             if isinstance(patch, (dict, BaseModel)):
                 if isinstance(patch, BaseModel):
@@ -467,6 +475,16 @@ def _ensure_patches(args: dict) -> list[Dict[str, Any]]:
                 op = patch.get("op")
                 path = patch.get("path")
                 if op and path:
+                    # LLM output is external data — validate JSON Pointer format
+                    # at the boundary. Gemini occasionally garbles paths (e.g.
+                    # ",path:" instead of "/side_deed/instances/-"), which would
+                    # crash the entire atomic patch bundle in jsonpatch.apply_patch.
+                    # Drop the bad patch to let the rest proceed, but record it
+                    # so callers can signal partial application to the user.
+                    if not isinstance(path, str) or not path.startswith('/'):
+                        logger.warning(f"Dropping patch with invalid JSON Pointer path: {path!r}")
+                        dropped_patches.append({"op": op, "path": path, "value": patch.get("value")})
+                        continue
                     if op == "remove":
                         processed_patches.append({"op": op, "path": path})
                     elif "value" in patch:  # Check for key presence, not truthiness (allows null values per RFC 6902)
@@ -488,7 +506,7 @@ def _ensure_patches(args: dict) -> list[Dict[str, Any]]:
                                     except (ValueError, SyntaxError, TypeError) as ast_e:
                                         logger.warning(f"Failed to parse patch value string as JSON or Python literal: {stripped_value[:100]}... Error: {ast_e}")
                         processed_patches.append({"op": op, "path": path, "value": parsed_value})
-        return processed_patches
+        return processed_patches, dropped_patches
     if isinstance(patches, str):
         stripped_patches_str = patches.strip()
         if stripped_patches_str.startswith('['):
@@ -518,4 +536,4 @@ def _ensure_patches(args: dict) -> list[Dict[str, Any]]:
                             logger.warning(f"Could not parse extracted list string in _ensure_patches: {first_list_str[:100]}...")
         else:
             logger.warning(f"_ensure_patches received a string that doesn't appear to be a list: {patches[:100]}...")
-    return []
+    return [], []

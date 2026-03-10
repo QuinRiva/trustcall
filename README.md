@@ -597,6 +597,23 @@ When using Gemini models, `trustcall` internally transforms Pydantic schemas to 
         ```
     *  **Example:** This is mostly useful when the data being retrieved **is actually** missing or incorrect.  If a @field_validator is used to ensure that the LLM returns a value for a date is a valid date, but the value in the document is **actually** `2024-02-30`, the @field_validator will raise an error.  By using `attempt_count` in the validation context, you be strict on the first attempt and lenient on subsequent attempts.
 
+#### Detecting Partial Patch Applications
+
+When updating existing schemas (especially with models like Gemini that can struggle with complex structured output), the LLM might occasionally generate an invalid JSON Pointer path for a specific edit. Instead of failing the entire update operation and losing all valid edits, `trustcall` drops the invalid patches and proceeds with the rest.
+
+You can detect if this has happened by checking for `dropped_patches` in the output dictionary. This signals that the update was partially successful, but some data the LLM intended to write was lost.
+
+*   **Usage:**
+    ```python
+    result = extractor.invoke(
+        {"messages": [("user", "Update the record")], "existing": {"MySchema": current_data}}
+    )
+    
+    if result.get("dropped_patches"):
+        print(f"Warning: {len(result['dropped_patches'])} edits were dropped due to invalid paths.")
+        # Decide whether to accept the partial result, retry, or fallback
+    ```
+
 ### Simultanous updates & insertions
 
 Both problems above (difficulty with type-safe generation of complex schemas & difficulty with generating the correct edits to existing schemas) are compounded when you have to be prompting the LLM to handle **both** updates **and** inserts, as is often the case when extracting multiple memory "events" from conversations.
