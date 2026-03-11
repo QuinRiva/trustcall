@@ -307,10 +307,24 @@ class _ExtractUpdates:
 
         for tc in msg.tool_calls:
             if tc["name"] == "PatchDoc":
-                json_doc_id = tc["args"]["json_doc_id"]
+                json_doc_id = str(tc["args"]["json_doc_id"]).strip()
                 if isinstance(existing, dict):
-                    target = existing.get(str(json_doc_id))
+                    target = existing.get(json_doc_id)
                     tool_name = json_doc_id
+                    # Gemini sometimes garbles json_doc_id (drops prefix, adds spaces).
+                    # Try suffix matching, then single-key fallback.
+                    if target is None:
+                        for k in existing:
+                            if k.endswith(json_doc_id) or json_doc_id.endswith(k):
+                                target = existing[k]
+                                tool_name = k
+                                logger.debug(f"Fuzzy-matched json_doc_id '{json_doc_id}' -> '{k}'")
+                                break
+                        if target is None and len(existing) == 1:
+                            only_key = next(iter(existing))
+                            target = existing[only_key]
+                            tool_name = only_key
+                            logger.debug(f"Single-key fallback for json_doc_id '{json_doc_id}' -> '{only_key}'")
                 else:
                     try:
                         _, tool_name, target = next(
@@ -363,6 +377,8 @@ class _ExtractUpdates:
                         logger.error(f"Could not apply patch: {e}")
                         if rt:
                             rt.error = f"Could not apply patch: {repr(e)}"
+                        msg.additional_kwargs.setdefault("patch_errors", {})[tc["id"]] = str(e)
+                        resolved_tool_calls.append(tc)
                 else:
                     if rt:
                         rt.error = f"Could not find existing schema for {tool_name}"
@@ -1052,6 +1068,15 @@ def create_extractor(
                     retry_state = ExtractionState(**{**asdict(state), "messages": clean_history, "attempts": state.attempts + 1})
                     return [Send("generate_missing_tool", retry_state)]
 
+            if m.additional_kwargs.get("is_patch_application_error"):
+                to_send.append(
+                    Send(
+                        "extract_updates",
+                        ExtractionState(**{**asdict(state), "attempts": state.attempts + 1})
+                    )
+                )
+                continue
+
             if m.additional_kwargs.get("is_error"):
                 error_content = str(m.content)
                 # # Construct a complete history for the LLM to make an informed patch.
@@ -1098,7 +1123,7 @@ def create_extractor(
         return to_send
 
     builder.add_conditional_edges(
-        "validate", handle_retries, path_map=["__end__", "patch", "__del_tool_call__", "generate_missing_tool", "extract"]
+        "validate", handle_retries, path_map=["__end__", "patch", "__del_tool_call__", "generate_missing_tool", "extract", "extract_updates"]
     )
     
     builder.add_edge("generate_missing_tool", "merge_tool_calls")

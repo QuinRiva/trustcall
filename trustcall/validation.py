@@ -271,6 +271,16 @@ class _ExtendedValidationNode(ValidationNode): # Inherit from local ValidationNo
         # We can override run_one to inject custom logic.
 
         def run_one_extended(call: ToolCall) -> ToolMessage:
+            patch_errors = message.additional_kwargs.get("patch_errors", {})
+            if call["id"] in patch_errors:
+                error_msg = patch_errors[call["id"]]
+                return ToolMessage(
+                    content=f"JSONPatch failed to apply: {error_msg}\n\nThe patch was rejected. You must generate a new PatchDoc. Look closely at the error message to understand which path was invalid, and verify the structure of the existing document before patching.",
+                    name=call["name"],
+                    tool_call_id=cast(str, call["id"]),
+                    additional_kwargs={"is_error": True, "is_patch_application_error": True},
+                )
+
             current_schema_to_validate: Union[Type[BaseModel], Type[BaseModelV1]]
             try:
                 if removal_schema and call["name"] == removal_schema.__name__:
