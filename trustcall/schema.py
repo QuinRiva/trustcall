@@ -1,16 +1,20 @@
 """
 Handles the creation, conversion, and management of schemas used for tool calling,
-validation, and patching, ensuring that trustcall can work with different 
-LLMs (including Gemini) and various schema formats.
+validation, and patching.
+
+NOTE: As of the langchain-google-genai 4.0.0 SDK migration, all GAPIC-era
+schema transformation code (ref inlining, type uppercasing, field filtering)
+has been removed. The new ChatGoogleGenerativeAI.bind_tools() handles Pydantic
+schema conversion internally via the google-genai SDK.
+See plans/gemini_structured_output_simplification_critique.md for rationale.
 """
 
 from __future__ import annotations
 
+import ast
 import functools
 import json
 import logging
-import ast # Import ast
-import re  # Import re for get_canonical_def_name
 from typing import (
     Any,
     Dict,
@@ -19,195 +23,27 @@ from typing import (
     Optional,
     Type,
     Union,
-    get_args,
-    get_origin,
-    Set,
 )
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    StrictBool,
-    StrictFloat,
-    StrictInt,
     field_validator,
 )
 
-from trustcall.utils import (
-    _exclude_none,
-    GEMINI_SUPPORTED_FIELDS,
-)
-
 logger = logging.getLogger("extraction")
-DEFAULT_GEMINI_SCHEMA_GEN_DEPTH = 5
-
-# Based on the error message from the Google API client.
-# See trustcall.utils.GEMINI_SUPPORTED_FIELDS for the centralized allowlist used during Gemini schema filtering.
 
 
-def get_canonical_def_name(
-    def_name: str,
-    definitions: Dict[str, Any],
-    model_title: Optional[str] = None
-) -> str:
-    if def_name in definitions and definitions[def_name].get("properties"):
-        return def_name
+def _get_schema(model: Type[BaseModel]) -> dict:
+    """Get the JSON schema for a Pydantic model.
 
-    base_name_match = re.match(r"(.+)(__\d+)$", def_name)
-    base_name_from_suffix = base_name_match.group(1) if base_name_match else def_name
-
-    possible_base_names = {base_name_from_suffix}
-    if model_title:
-        possible_base_names.add(model_title)
-        if "__" in base_name_from_suffix: 
-            fqn_prefix_parts = base_name_from_suffix.split('__')
-            if len(fqn_prefix_parts) > 1:
-                reconstructed_fqn_base = "__".join(fqn_prefix_parts[:-1]) 
-                possible_base_names.add(f"{reconstructed_fqn_base}__{model_title}")
-
-    best_candidate = def_name
-    best_candidate_is_complete = bool(definitions.get(def_name, {}).get("properties"))
-
-    for p_base_name in possible_base_names:
-        candidates_to_check = [p_base_name] + [f"{p_base_name}__{i}" for i in range(1, 4)] 
-
-        for candidate_name in candidates_to_check:
-            if candidate_name in definitions:
-                candidate_is_complete = bool(definitions[candidate_name].get("properties"))
-                
-                if candidate_is_complete:
-                    if not best_candidate_is_complete:
-                        best_candidate = candidate_name
-                        best_candidate_is_complete = True
-                    elif len(candidate_name) < len(best_candidate):
-                        best_candidate = candidate_name
-                elif not best_candidate_is_complete and candidate_name == p_base_name:
-                    best_candidate = candidate_name 
-
-    return best_candidate
-
-
-def _transform_schema_for_gemini_recursive(
-    schema_node: Dict[str, Any],
-    all_definitions: Dict[str, Any],
-    current_depth: int,
-    max_inlining_depth: int,
-    visited_refs: Optional[Set[str]] = None
-) -> Dict[str, Any]:
+    After the GAPIC removal, this is a thin wrapper around model_json_schema().
+    Kept as a named function because it's called from multiple sites (error
+    formatting, update prompts) and provides a single point if schema
+    post-processing is ever needed again.
     """
-    Recursively traverses a JSON schema, inlining references and stripping
-    unsupported fields to make it compatible with the Google AI Platform
-    GAPIC client library for Gemini.
-    """
-    visited_refs = visited_refs or set()
-
-    # 1. Handle $ref inlining first.
-    if "$ref" in schema_node:
-        ref_path = schema_node["$ref"]
-        original_def_name = ref_path.split('/')[-1]
-        canonical_def_name = get_canonical_def_name(original_def_name, all_definitions)
-
-        if current_depth > max_inlining_depth:
-            return {"type": "OBJECT", "description": f"Recursive definition of {canonical_def_name} omitted."}
-
-        if canonical_def_name in all_definitions:
-            definition_to_inline = all_definitions[canonical_def_name]
-            new_visited_refs = visited_refs | {canonical_def_name}
-            return _transform_schema_for_gemini_recursive(
-                definition_to_inline, all_definitions, current_depth + 1, max_inlining_depth, new_visited_refs
-            )
-        else:
-            return {"type": "OBJECT", "description": f"Unresolved reference: {ref_path}"}
-
-    # 2. For a concrete node (no $ref), transform it by filtering and recursing.
-    new_node = {}
-    for key, value in schema_node.items():
-        if key not in GEMINI_SUPPORTED_FIELDS:
-            continue
-
-        if key == 'properties':
-            # Special handling for properties: recurse on each property's schema (the value),
-            # but keep the property name (the key) as is.
-            new_node[key] = {
-                prop_name: _transform_schema_for_gemini_recursive(prop_schema, all_definitions, current_depth, max_inlining_depth, visited_refs)
-                for prop_name, prop_schema in value.items()
-            }
-        elif isinstance(value, dict):
-            new_node[key] = _transform_schema_for_gemini_recursive(value, all_definitions, current_depth, max_inlining_depth, visited_refs)
-        elif isinstance(value, list) and key != 'enum':
-            new_node[key] = [
-                _transform_schema_for_gemini_recursive(item, all_definitions, current_depth, max_inlining_depth, visited_refs)
-                if isinstance(item, dict) else item
-                for item in value
-            ]
-        else:
-            new_node[key] = value
-
-    # 3. Handle type uppercasing and anyOf/oneOf logic on the transformed node
-    if "type" in new_node and isinstance(new_node["type"], str):
-        new_node["type"] = new_node["type"].upper()
-
-    # Handle both anyOf and oneOf (Pydantic uses oneOf for discriminated unions)
-    # Note: GAPIC protobuf only supports anyOf, not oneOf, so we convert oneOf to anyOf
-    for union_key in ["anyOf", "oneOf"]:
-        if union_key in new_node:
-            union_items = new_node.get(union_key, [])
-            null_items = [t for t in union_items if t.get("type") == "NULL"]
-            non_null_items = [t for t in union_items if t.get("type") != "NULL"]
-            
-            # Only collapse if this is a simple nullable union (one NULL + one non-NULL)
-            if union_key == "anyOf" and len(null_items) == 1 and len(non_null_items) == 1:
-                # This is a nullable union pattern, collapse it
-                del new_node[union_key]
-                new_node.update(non_null_items[0])
-                new_node["nullable"] = True
-            else:
-                # This is a true union (multiple non-null types or other patterns)
-                # Convert oneOf to anyOf for GAPIC compatibility
-                if union_key == "oneOf":
-                    new_node["anyOf"] = new_node.pop("oneOf")
-                    union_key = "anyOf"  # Update reference for the loop below
-                    
-                # Ensure types are uppercased within the union items
-                for item in new_node[union_key]:
-                    if "type" in item and isinstance(item["type"], str):
-                        item["type"] = item["type"].upper()
-
-    return _exclude_none(new_node)
-
-
-def _create_gemini_schema_with_inlining(standard_schema: Dict[str, Any], max_depth: int) -> Dict[str, Any]:
-    all_definitions = standard_schema.pop('$defs', standard_schema.pop('definitions', {}))
-    
-    transformed_root = _transform_schema_for_gemini_recursive(standard_schema, all_definitions, 0, max_depth, None)
-    
-    if "required" in standard_schema and "required" not in transformed_root and transformed_root.get("type") != "OBJECT":
-        transformed_root["required"] = standard_schema["required"]
-
-    return _exclude_none(transformed_root)
-
-
-def _get_schema(
-    model: Type[BaseModel],
-    for_gemini: bool,
-    gemini_ref_strategy: Literal["inline", "intelligent"] = "inline",
-    gemini_schema_recursion_depth: Optional[int] = None,
-) -> dict:
-    """
-    Gets the JSON schema for a Pydantic model, handling different strategies for Gemini.
-    """
-    if for_gemini:
-        if gemini_ref_strategy == "inline":
-            standard_schema = model.model_json_schema()
-            actual_depth = gemini_schema_recursion_depth if gemini_schema_recursion_depth is not None else DEFAULT_GEMINI_SCHEMA_GEN_DEPTH
-            transformed_schema = _create_gemini_schema_with_inlining(standard_schema, actual_depth)
-            return transformed_schema
-        else:  # intelligent
-            schema = model.model_json_schema(ref_template="#/$defs/{model}")
-            return schema
-    else:
-        return model.model_json_schema()
+    return model.model_json_schema()
 
 
 # JSON Patch related classes
@@ -278,64 +114,8 @@ class FullPatch(BasePatch):
         }
     )
 
-# It is hypothesized that Gemini's JSON mode has improved and the stringification
-# of complex values is no longer necessary. To test this, we are commenting out
-# the specialized GeminiJsonPatch and aliasing it to FullPatch.
-# class GeminiJsonPatch(BasePatch):
-#     """A JSON Patch document represents an operation to be performed on a JSON document.
-#
-#     Note that the op and path are ALWAYS required. Value is required for ALL operations except 'remove'.
-#     This supports Gemini with it's more limited JSON compatibility.
-#     """ # noqa
-#
-#     value: Optional[str] = Field(
-#         default=None,
-#         description="The value to be used within the operation. For complex values (objects, arrays), "
-#         "provide valid JSON as a string. Required for 'add' and 'replace' operations."
-#     )
-#
-#     @field_validator('value')
-#     @classmethod
-#     def validate_value(cls, v, info):
-#         values = info.data
-#         if v is None and values.get("op") == "remove":
-#             return v
-#         if isinstance(v, (dict, list)):
-#             return json.dumps(v)
-#         if v is not None and not isinstance(v, str):
-#             return str(v)
-#         return v
-#
-#     model_config = ConfigDict(
-#         json_schema_extra={
-#             "type": "OBJECT",
-#             "properties": {
-#                 "op": {
-#                     "type": "STRING",
-#                     "enum": ["add", "remove", "replace"],
-#                     "description": "The operation to be performed."
-#                 },
-#                 "path": {
-#                     "type": "STRING",
-#                     "description": "JSON Pointer path where the operation is performed."
-#                 },
-#                 "value": {
-#                     "type": "STRING",
-#                     "description": "The value to be used within the operation. For complex values (objects, arrays), "
-#                                    "provide valid JSON as a string. Required for 'add' and 'replace' operations."
-#                 }
-#             },
-#             "required": ["op", "path"]
-#         }
-#     )
-GeminiJsonPatch = FullPatch
 
-def get_patch_class(for_gemini: bool) -> Type[BasePatch]:
-    return GeminiJsonPatch if for_gemini else FullPatch
-
-def _create_patch_function_errors_schema(for_gemini: bool = False) -> Type[BaseModel]:
-    patch_class = get_patch_class(for_gemini)
-    
+def _create_patch_function_errors_schema() -> Type[BaseModel]:
     class PatchFunctionErrors(BaseModel):
         """Respond with all JSONPatch operations required to update the previous invalid function call."""
         json_doc_id: str = Field(..., description="First, identify the json_doc_id of the function you are patching.")
@@ -350,7 +130,7 @@ def _create_patch_function_errors_schema(for_gemini: bool = False) -> Type[BaseM
             " Think step-by-step to ensure no error is overlooked."
             " When planning to add a new list item (e.g., a missing document), plan a single `add` operation with the *complete* object as the value. Do NOT plan an `add` followed by `replace` operations on the fields of the newly added item.",
         )
-        patches: list[patch_class] = Field(
+        patches: list[FullPatch] = Field(
             ...,
             description="Finally, provide a list of JSONPatch operations to be applied to"
             " the previous tool call's response arguments. If none are required, return"
@@ -361,9 +141,7 @@ def _create_patch_function_errors_schema(for_gemini: bool = False) -> Type[BaseM
         )
     return PatchFunctionErrors
 
-def _create_patch_doc_schema(for_gemini: bool = False) -> Type[BaseModel]:
-    patch_class = get_patch_class(for_gemini)
-    
+def _create_patch_doc_schema() -> Type[BaseModel]:
     class PatchDoc(BaseModel):
         """Respond with JSONPatch operations to update the existing JSON document based on the provided text and schema."""
         json_doc_id: str = Field(..., description="First, identify the json_doc_id of the document you are patching.")
@@ -381,7 +159,7 @@ def _create_patch_doc_schema(for_gemini: bool = False) -> Type[BaseModel]:
             " indices. This ensures subsequent remove operations remain valid.\n"
             " 3. add (for arrays, use /- to efficiently append to end).",
         )
-        patches: List[patch_class] = Field(
+        patches: List[FullPatch] = Field(
             ...,
             description="Finally, provide a list of JSONPatch operations to be applied to"
             " the previous tool call's response arguments. If none are required, return"
@@ -396,7 +174,7 @@ def _create_patch_doc_schema(for_gemini: bool = False) -> Type[BaseModel]:
         )
     return PatchDoc
 
-def _create_patch_function_name_schema(valid_tool_names: Optional[List[str]] = None, for_gemini: bool = False):
+def _create_patch_function_name_schema(valid_tool_names: Optional[List[str]] = None):
     if valid_tool_names:
         namestr = ", ".join(valid_tool_names)
         vname = f" Must be one of {namestr}"
@@ -416,19 +194,6 @@ def _create_patch_function_name_schema(valid_tool_names: Optional[List[str]] = N
             ...,
             description="Finally, if you need to change the name of the function (e.g.,"
             f' from an "Unrecognized tool name" error), do so here.{vname}',
-        )
-    if for_gemini:
-        # Set a Gemini-compatible schema for the model
-        PatchFunctionName.model_config = ConfigDict(
-            json_schema_extra={
-                "type": "OBJECT",
-                "properties": {
-                    "json_doc_id": {"type": "STRING", "description": "The ID of the function you are patching."},
-                    "reasoning": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "At least 2 logical reasons why this action ought to be taken."},
-                    "fixed_name": {"type": "STRING", "description": f"The corrected function name.{vname}"}
-                },
-                "required": ["json_doc_id", "reasoning"]
-            }
         )
     return PatchFunctionName
 

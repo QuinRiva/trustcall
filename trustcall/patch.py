@@ -54,9 +54,6 @@ class _Patch:
         valid_tool_names: Optional[List[str]] = None,
         on_attempt: Optional[Callable[["AttemptInfo"], None]] = None,
     ):
-        # Get the appropriate patching tools based on LLM type
-        using_gemini = is_gemini_model(llm)
-        
         bind_kwargs = {}
         # IMPORTANT: Do not use tool_choice="any" for Gemini.
         # Gemini 3.1 Pro Preview has an undocumented backend bug where forcing
@@ -65,13 +62,13 @@ class _Patch:
         # to degrade, defaulting to scalars like `-1` or `None` instead of complex
         # lists/dicts. By omitting tool_choice (falling back to "AUTO"), Gemini
         # correctly hallucinates and generates the untyped JSON structures natively.
-        if not using_gemini:
+        if not is_gemini_model(llm):
             bind_kwargs["tool_choice"] = "any"
 
         self.bound = llm.bind_tools(
             [
-                _create_patch_function_errors_schema(using_gemini),
-                _create_patch_function_name_schema(valid_tool_names, using_gemini)
+                _create_patch_function_errors_schema(),
+                _create_patch_function_name_schema(valid_tool_names)
             ],
             **bind_kwargs
         )

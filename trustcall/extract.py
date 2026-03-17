@@ -56,10 +56,7 @@ from trustcall.types import (
     Messages,
     SchemaInstance,
 )
-from trustcall.utils import (
-    is_gemini_model,
-    _patch_vertexai_for_gemini_ref,
-)
+from trustcall.utils import is_gemini_model
 from trustcall.validation import _ExtendedValidationNode
 from trustcall.states import ExtractionState, ExtendedExtractState, DeletionState, MessageOp
 
@@ -87,38 +84,9 @@ class _Extract:
         llm: BaseChatModel,
         tools: Sequence,
         tool_choice: Optional[str] = None,
-        for_gemini: bool = False,
-        gemini_ref_strategy: Literal["inline", "intelligent"] = "inline",
-        gemini_schema_recursion_depth: Optional[int] = None,
     ):
         self.llm = llm
-        tools_to_bind = []
-        if for_gemini:
-            if gemini_ref_strategy == "intelligent":
-                _patch_vertexai_for_gemini_ref()
-            
-            for tool in tools:
-                if isinstance(tool, type) and issubclass(tool, BaseModel):
-                    schema = _get_schema(
-                        tool,
-                        for_gemini=True,
-                        gemini_ref_strategy=gemini_ref_strategy,
-                        gemini_schema_recursion_depth=gemini_schema_recursion_depth,
-                    )
-                    tools_to_bind.append({
-                        "type": "function",
-                        "function": {
-                            "name": schema.get("title", tool.__name__),
-                            "description": schema.get("description", tool.__doc__ or ""),
-                            "parameters": schema,
-                        },
-                    })
-                else:
-                    tools_to_bind.append(tool)
-        else:
-            tools_to_bind = list(tools)
-
-        self.bound_llm = llm.bind_tools(tools_to_bind, tool_choice=tool_choice)
+        self.bound_llm = llm.bind_tools(list(tools), tool_choice=tool_choice)
 
     @ls.traceable
     def _tear_down(self, msg: AIMessage) -> dict:
@@ -163,21 +131,16 @@ class _ExtractUpdates:
         enable_updates: bool = True,
         enable_deletes: bool = False,
         existing_schema_policy: bool | Literal["ignore"] = True,
-        gemini_ref_strategy: Literal["inline", "intelligent"] = "inline",
-        gemini_schema_recursion_depth: Optional[int] = None,
     ):
-        self.gemini_ref_strategy = gemini_ref_strategy
-        self.gemini_schema_recursion_depth = gemini_schema_recursion_depth
         if not any((enable_inserts, enable_updates, enable_deletes)):
             raise ValueError(
                 "At least one of enable_inserts, enable_updates,"
                 " or enable_deletes must be True."
             )
         
-        # Get the appropriate patching tools - Gemini supports simpler JSON schemas, so requires different tools
         using_gemini = is_gemini_model(llm)
-        patch_doc = _create_patch_doc_schema(using_gemini)
-        patch_function_errors = _create_patch_function_errors_schema(using_gemini)
+        patch_doc = _create_patch_doc_schema()
+        patch_function_errors = _create_patch_function_errors_schema()
         
         new_tools: list = [patch_doc] if enable_updates else []
         tool_choice = "PatchDoc" if not enable_deletes else "any"
@@ -227,12 +190,7 @@ class _ExtractUpdates:
                     schema_str = "object"
                 else:
                     schema = self.tools[k]
-                    schema_json = _get_schema(
-                        schema,
-                        self.using_gemini,
-                        gemini_ref_strategy=self.gemini_ref_strategy,
-                        gemini_schema_recursion_depth=self.gemini_schema_recursion_depth,
-                    )
+                    schema_json = _get_schema(schema)
                     schema_str = f"""
     <json_schema>
     {schema_json}
@@ -320,7 +278,10 @@ class _ExtractUpdates:
                                 tool_name = k
                                 logger.debug(f"Fuzzy-matched json_doc_id '{json_doc_id}' -> '{k}'")
                                 break
-                        if target is None and len(existing) == 1:
+                        # Single-key fallback: only use when the mismatch is likely
+                        # due to Gemini garbling the id (not when "ignore" policy
+                        # intentionally filtered the schema out of `existing`).
+                        if target is None and len(existing) == 1 and self.existing_schema_policy != "ignore":
                             only_key = next(iter(existing))
                             target = existing[only_key]
                             tool_name = only_key
@@ -367,7 +328,7 @@ class _ExtractUpdates:
                                 ToolCall(
                                     id=tc["id"],
                                     name=tool_name,
-                                    args=_apply_patch(target, patches), # Use local _apply_patch
+                                    args=_apply_patch(target, patches),
                                 )
                             )
                             updated_docs[tc["id"]] = str(json_doc_id)
@@ -604,8 +565,6 @@ def create_extractor(
     enable_updates: bool = True,
     enable_deletes: bool = False,
     existing_schema_policy: bool | Literal["ignore"] = True,
-    gemini_ref_strategy: Literal["inline", "intelligent"] = "inline",
-    gemini_schema_recursion_depth: Optional[int] = None,
     on_attempt: Optional[Callable[[AttemptInfo], None]] = None,
 ) -> Runnable[InputsLike, ExtractionOutputs]:
     """Create an extractor that generates validated structured outputs using an LLM.
@@ -635,12 +594,6 @@ def create_extractor(
             that don't match the provided tool. Useful for migrating or managing heterogenous
             docs. (default: True) True means raise error. False means treat as dict.
             "ignore" means ignore (drop any attempts to patch these)
-        gemini_ref_strategy (Literal["inline", "intelligent"]): The strategy to use
-            for handling schema references in Gemini models. (default: "inline")
-
-        gemini_schema_recursion_depth (Optional[int]): The maximum recursion depth
-            for inlining schema definitions when using the 'inline' strategy with
-            Gemini models. (default: 5)
         on_attempt (Optional[Callable[[AttemptInfo], None]]): Callback invoked after
             each LLM extraction attempt, providing observability into retry behavior.
             Called with AttemptInfo containing: attempt_number, ai_message,
@@ -776,12 +729,6 @@ def create_extractor(
                 " Please install langchain to continue."
             )
     builder = StateGraph(ExtractionState)
-    
-    # Check if the model is a Gemini model - this affects the schema generation and patching
-    using_gemini = is_gemini_model(llm)
-
-    if using_gemini and gemini_ref_strategy == "intelligent":
-        _patch_vertexai_for_gemini_ref()
 
     # Define error formatting
     # TODO: Need to better evaluate if this all required in the standard template
@@ -823,7 +770,7 @@ def create_extractor(
             "---\n\n"
             f"**Validation Error:**\n\n```\n{error_details}\n```\n\n"
             "**Expected Parameter Schema:**\n\n"
-            f"```json\n{_get_schema(schema, using_gemini, gemini_ref_strategy=gemini_ref_strategy, gemini_schema_recursion_depth=gemini_schema_recursion_depth)}\n```\n\n"
+            f"```json\n{_get_schema(schema)}\n```\n\n"
             "**JSONPatch Operation Guide:**\n\n"
             "**1. Empty object (`input_value={}`):**\n"
             "You returned `{}` where the schema required specific fields. "
@@ -846,9 +793,8 @@ def create_extractor(
             f"Use PatchFunctionErrors to fix all validation errors for json_doc_id=[{call['id']}]."
         )
     
-    # Get the appropriate patching tools - Gemini supports simpler JSON schemas, so requires different tools
-    patch_doc = _create_patch_doc_schema(using_gemini)
-    patch_function_errors = _create_patch_function_errors_schema(using_gemini)
+    patch_doc = _create_patch_doc_schema()
+    patch_function_errors = _create_patch_function_errors_schema()
 
     # Create validator with appropriate tools
     validator = _ExtendedValidationNode(
@@ -869,9 +815,6 @@ def create_extractor(
             llm,
             _extract_tools,
             tool_choice,
-            for_gemini=using_gemini,
-            gemini_ref_strategy=gemini_ref_strategy,
-            gemini_schema_recursion_depth=gemini_schema_recursion_depth,
         ).as_runnable()
     )
     updater = _ExtractUpdates(
@@ -881,8 +824,6 @@ def create_extractor(
         enable_updates=enable_updates,  # type: ignore
         enable_deletes=enable_deletes,  # type: ignore
         existing_schema_policy=existing_schema_policy,
-        gemini_ref_strategy=gemini_ref_strategy,
-        gemini_schema_recursion_depth=gemini_schema_recursion_depth,
     )
     builder.add_node(updater.as_runnable())
     builder.add_node(_Patch(llm, valid_tool_names=tool_names, on_attempt=on_attempt).as_runnable())
@@ -1172,75 +1113,43 @@ def create_extractor(
         responses = []
         response_metadata = []
 
-        # This is the Gemini bypass path. The tool calls are in additional_kwargs
-        # and need to be manually parsed and added to the message for tracing.
-        if not msg.tool_calls and msg.additional_kwargs.get("function_call"):
-            raw_function_call = msg.additional_kwargs["function_call"]
-            tool_name = raw_function_call.get("name")
+        updated_docs = msg.additional_kwargs.get("updated_docs") or {}
+        existing = state.get("existing")
+        removal_schema = None
+        if enable_deletes and existing:
+            removal_schema = _create_remove_doc_from_existing(existing)
             
+        for tc in msg.tool_calls:
+            # Determine the schema to use for validation
+            if removal_schema and tc["name"] == removal_schema.__name__:
+                schema_to_validate = removal_schema
+            elif tc["name"] in validator.schemas_by_name:
+                schema_to_validate = validator.schemas_by_name[tc["name"]]
+            else:
+                if existing_schema_policy in (False, "ignore"):
+                    continue
+                logger.warning(f"Unrecognized tool call in standard path: {tc['name']}")
+                continue
+
+            # Validate and append the response
             try:
-                # Arguments are returned as a string, so they must be loaded.
-                tool_args = json.loads(raw_function_call.get("arguments", "{}"))
+                validation_context = state.get("validation_context")
+                validated_response = schema_to_validate.model_validate(
+                    tc["args"], context=validation_context
+                )
+                responses.append(validated_response)
                 
-                if tool_name in validator.schemas_by_name:
-                    schema = validator.schemas_by_name[tool_name]
-                    validated_data = schema.model_validate(tool_args)
-                    responses.append(validated_data)
-                    
-                    # For tracing, we need to reconstruct the ToolCall object.
-                    tool_call_id = str(uuid.uuid4())
-                    reconstructed_tool_call = ToolCall(
-                        name=tool_name, args=tool_args, id=tool_call_id
-                    )
-                    msg.tool_calls = [reconstructed_tool_call]
-                    response_metadata.append({"id": tool_call_id, "name": tool_name, "usage_metadata": msg.usage_metadata})
-                else:
-                    logger.warning(f"Unrecognized tool call from Gemini: {tool_name}")
-
-            except (json.JSONDecodeError, TypeError) as e:
-                logger.error(f"Failed to parse or validate Gemini tool call: {e}")
+                meta = {
+                    "id": tc["id"],
+                    "name": tc["name"],
+                    "usage_metadata": msg.usage_metadata,
+                }
+                if json_doc_id := updated_docs.get(tc["id"]):
+                    meta["json_doc_id"] = json_doc_id
+                response_metadata.append(meta)
             except Exception as e:
-                logger.error(f"An unexpected error occurred during Gemini response parsing: {e}")
-
-        # This is the standard path for most models, or for Gemini when not using the bypass.
-        else:
-            updated_docs = msg.additional_kwargs.get("updated_docs") or {}
-            existing = state.get("existing")
-            removal_schema = None
-            if enable_deletes and existing:
-                removal_schema = _create_remove_doc_from_existing(existing)
-                
-            for tc in msg.tool_calls:
-                # Determine the schema to use for validation
-                if removal_schema and tc["name"] == removal_schema.__name__:
-                    schema_to_validate = removal_schema
-                elif tc["name"] in validator.schemas_by_name:
-                    schema_to_validate = validator.schemas_by_name[tc["name"]]
-                else:
-                    if existing_schema_policy in (False, "ignore"):
-                        continue
-                    logger.warning(f"Unrecognized tool call in standard path: {tc['name']}")
-                    continue
-
-                # Validate and append the response
-                try:
-                    validation_context = state.get("validation_context")
-                    validated_response = schema_to_validate.model_validate(
-                        tc["args"], context=validation_context
-                    )
-                    responses.append(validated_response)
-                    
-                    meta = {
-                        "id": tc["id"],
-                        "name": tc["name"],
-                        "usage_metadata": msg.usage_metadata,
-                    }
-                    if json_doc_id := updated_docs.get(tc["id"]):
-                        meta["json_doc_id"] = json_doc_id
-                    response_metadata.append(meta)
-                except Exception as e:
-                    logger.error(f"Error validating tool call for {tc['name']}: {e}")
-                    continue
+                logger.error(f"Error validating tool call for {tc['name']}: {e}")
+                continue
 
         # Normalize usage metadata
         if msg and msg.usage_metadata:

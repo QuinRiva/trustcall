@@ -22,8 +22,8 @@ from trustcall.extract import _Extract, _ExtractUpdates
 from trustcall.patch import _Patch
 
 # Create default versions of PatchDoc and PatchFunctionErrors for backward compatibility
-PatchDoc = _create_patch_doc_schema(for_gemini=False)
-PatchFunctionErrors = _create_patch_function_errors_schema(for_gemini=False)
+PatchDoc = _create_patch_doc_schema()
+PatchFunctionErrors = _create_patch_function_errors_schema()
 
 __all__ = [
     "AttemptInfo",
