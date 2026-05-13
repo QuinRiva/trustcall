@@ -6,8 +6,10 @@ patch-based extraction for efficient and accurate updates to existing schemas.
 """
 
 from trustcall._base import AttemptInfo, ExtractionInputs, ExtractionOutputs, create_extractor
+from trustcall.exceptions import AggregatedValidationError
 
 __all__ = [
+    "AggregatedValidationError",
     "AttemptInfo",
     "create_extractor",
     "ExtractionInputs",

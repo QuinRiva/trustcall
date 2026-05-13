@@ -566,6 +566,7 @@ def create_extractor(
     enable_deletes: bool = False,
     existing_schema_policy: bool | Literal["ignore"] = True,
     on_attempt: Optional[Callable[[AttemptInfo], None]] = None,
+    max_validation_error_weight: Optional[int] = None,
 ) -> Runnable[InputsLike, ExtractionOutputs]:
     """Create an extractor that generates validated structured outputs using an LLM.
 
@@ -599,6 +600,39 @@ def create_extractor(
             Called with AttemptInfo containing: attempt_number, ai_message,
             validation_errors (list of error strings or None), and is_success flag.
             Useful for logging raw LLM responses when validation fails. (default: None)
+        max_validation_error_weight (Optional[int]): If set, validation failures
+            whose summed error weight strictly exceeds this threshold will skip
+            the JSON-Patch repair path and instead re-extract from a clean
+            message history (still bounded by ``max_attempts``). Each entry in
+            ``ValidationError.errors()`` contributes weight 1 by default;
+            users may raise :class:`trustcall.AggregatedValidationError`
+            inside their own Pydantic validators to declare the true weight
+            of an aggregated error. Defaults to ``None`` (feature off; no
+            behaviour change).
+
+            Example aggregating validator::
+
+                from pydantic import BaseModel, model_validator
+                from trustcall import AggregatedValidationError, create_extractor
+
+                class Doc(BaseModel):
+                    refs: list[str]
+
+                    @model_validator(mode="after")
+                    def check_refs(self):
+                        missing = [r for r in self.refs if not r.startswith("ok-")]
+                        if missing:
+                            raise AggregatedValidationError(
+                                f"{len(missing)} refs missing prefix",
+                                count=len(missing),
+                            )
+                        return self
+
+                extractor = create_extractor(
+                    llm,
+                    tools=[Doc],
+                    max_validation_error_weight=10,
+                )
 
     Returns:
         Runnable[ExtractionInputs, ExtractionOutputs]: A runnable that
@@ -942,6 +976,9 @@ def create_extractor(
     def handle_retries(state: ExtractionState, config: RunnableConfig) -> Union[Literal["__end__"], list]:
         """After validation, decide whether to retry or end the process."""
         max_attempts = config["configurable"].get("max_attempts", DEFAULT_MAX_ATTEMPTS)
+        max_weight = config["configurable"].get(
+            "max_validation_error_weight", max_validation_error_weight
+        )
         
         # Defensive check for AIMessage
         if not any(isinstance(m, AIMessage) for m in state.messages):
@@ -991,6 +1028,22 @@ def create_extractor(
                     is_success=True,
                 ))
             return "__end__"
+
+        # Threshold gate: if any failed tool call's validation error weight
+        # exceeds the configured threshold, skip the patch path entirely and
+        # re-extract from a clean message history. Bounded by max_attempts.
+        if max_weight is not None and state.attempts < max_attempts and any(
+            m.additional_kwargs.get("validation_error_weight", 0) > max_weight
+            for m in relevant_tool_messages
+        ):
+            logger.info(
+                f"Re-extracting from scratch: validation error weight exceeded "
+                f"threshold ({max_weight}). Attempt {state.attempts}/{max_attempts}."
+            )
+            clean_history = [m for m in state.messages if not isinstance(m, (AIMessage, ToolMessage))]
+            retry_state = ExtractionState(**{**asdict(state), "messages": clean_history, "attempts": state.attempts + 1})
+            entry = "extract_updates" if state.existing else "extract"
+            return [Send(entry, retry_state)]
 
         # Proceed with retry logic - callback is fired from _Patch when patching fails
         to_send = []

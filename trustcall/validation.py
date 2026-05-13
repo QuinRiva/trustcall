@@ -237,6 +237,8 @@ import logging # Keep this
 # from langchain_core.runnables import RunnableConfig # Already imported
 from dataclasses import asdict # Keep this
 
+from trustcall.exceptions import AggregatedValidationError
+
 logger = logging.getLogger("extraction") # Keep this
 
 
@@ -332,14 +334,28 @@ class _ExtendedValidationNode(ValidationNode): # Inherit from local ValidationNo
                     logger.debug(f"Detailed Pydantic errors: {json.dumps(detailed_errors)}")
                 except Exception as log_e:
                     logger.debug(f"Error logging detailed Pydantic errors: {log_e}")
-                
+
+                # Sum per-entry weight: AggregatedValidationError(count=N) contributes N,
+                # any other ValueError contributes 1. Pydantic v2 preserves the original
+                # exception under err["ctx"]["error"] for value_error-typed entries.
+                # Pydantic v1 falls through to default weight=1 per entry.
+                weight = sum(
+                    err["ctx"]["error"].count
+                    if isinstance(err.get("ctx", {}).get("error"), AggregatedValidationError)
+                    else 1
+                    for err in e.errors()
+                ) if hasattr(e, "errors") else 1
+
                 # Use _format_error from the base class (or the one passed in __init__)
                 error_message = self._format_error(e, call, current_schema_to_validate)
                 return ToolMessage(
                     content=error_message,
                     name=call["name"],
                     tool_call_id=cast(str, call["id"]),
-                    additional_kwargs={"is_error": True}, # Base class uses this
+                    additional_kwargs={
+                        "is_error": True,
+                        "validation_error_weight": weight,
+                    },
                 )
             except Exception as e: # Other unexpected errors during validation
                 # Fallback to a generic error format if _format_error isn't suitable or schema isn't resolved

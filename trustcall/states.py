@@ -158,14 +158,28 @@ def _keep_first(left: Any, right: Any):
     """Keep the first non-empty value."""
     return left or right
 
+def _take_latest_nonempty(left: Any, right: Any):
+    """Take the latest non-empty value (right wins if non-empty).
+
+    Used for msg_id so that re-extract paths (threshold gate,
+    is_empty_response) can re-set the id of the AIMessage filter_state
+    resolves; with _keep_first the original (deleted) AIMessage's id
+    would persist forever and re-extracted results would be invisible.
+    """
+    return right or left
+
 @dataclass(kw_only=True)
 class ExtractionState:
     messages: Annotated[List[AnyMessage], _reduce_messages] = field(
         default_factory=list
     )
     attempts: Annotated[int, operator.add] = field(default=0)
-    msg_id: Annotated[str, _keep_first] = field(default="")
-    """Set once and never changed. The ID of the message to be patched."""
+    msg_id: Annotated[str, _take_latest_nonempty] = field(default="")
+    """The ID of the message filter_state resolves as the final result.
+
+    Updated by extract / extract_updates teardown. Latest non-empty value
+    wins so that re-extract paths can refresh the id after the original
+    AIMessage has been removed from the message history."""
     existing: Optional[Dict[str, Any]] = field(default=None)
     """If you're updating an existing schema, provide the existing schema here."""
     validation_context: Annotated[Optional[Dict[str, Any]], _keep_first] = field(default=None)
