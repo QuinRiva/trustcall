@@ -56,7 +56,11 @@ from trustcall.types import (
     Messages,
     SchemaInstance,
 )
-from trustcall.utils import is_gemini_model
+from trustcall.utils import (
+    _dedup_same_name_tool_calls,
+    _resolve_tool_name,
+    is_gemini_model,
+)
 from trustcall.validation import _ExtendedValidationNode
 from trustcall.states import ExtractionState, ExtendedExtractState, DeletionState, MessageOp
 
@@ -86,12 +90,34 @@ class _Extract:
         tool_choice: Optional[str] = None,
     ):
         self.llm = llm
+        self.tool_choice = tool_choice
+        self.tool_names: List[str] = [_resolve_tool_name(t) for t in tools]
         self.bound_llm = llm.bind_tools(list(tools), tool_choice=tool_choice)
+
+    def _single_call_target(self) -> Optional[str]:
+        """Schema name the user contract treats as 'exactly one call', else None.
+
+        Inferred-gating policy:
+        - ``tool_choice="<name>"`` (any string other than ``any``/``auto``/
+          ``required``) pins to that schema.
+        - ``tool_choice is None`` with a single bound tool implies the same.
+        Anything else (multiple tools, ``"any"``/``"auto"``/``"required"``)
+        keeps the multi-call contract and disables dedup.
+        """
+        tc = self.tool_choice
+        if isinstance(tc, str) and tc not in {"any", "auto", "required"}:
+            return tc
+        if tc is None and len(self.tool_names) == 1:
+            return self.tool_names[0]
+        return None
 
     @ls.traceable
     def _tear_down(self, msg: AIMessage) -> dict:
         if not msg.id:
             msg.id = str(uuid.uuid4())
+        target = self._single_call_target()
+        if target is not None:
+            msg = _dedup_same_name_tool_calls(msg, target_name=target)
         return {
             "messages": [msg],
             "attempts": 1,
@@ -1061,6 +1087,11 @@ def create_extractor(
                     clean_history = [msg for msg in state.messages if not isinstance(msg, ToolMessage)]
                     retry_state = ExtractionState(**{**asdict(state), "messages": clean_history, "attempts": state.attempts + 1})
                     return [Send("generate_missing_tool", retry_state)]
+
+            if m.additional_kwargs.get("is_divergent_tool_calls"):
+                clean_history = [msg for msg in state.messages if not isinstance(msg, (AIMessage, ToolMessage))]
+                retry_state = ExtractionState(**{**asdict(state), "messages": clean_history, "attempts": state.attempts + 1})
+                return [Send("extract_updates" if state.existing else "extract", retry_state)]
 
             if m.additional_kwargs.get("is_patch_application_error"):
                 to_send.append(

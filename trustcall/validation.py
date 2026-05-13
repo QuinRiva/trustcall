@@ -376,7 +376,22 @@ class _ExtendedValidationNode(ValidationNode): # Inherit from local ValidationNo
         # Use the executor from the base class's config
         with get_executor_for_config(config) as executor:
             outputs = [*executor.map(run_one_extended, message.tool_calls)]
-        
+
+        divergent = message.additional_kwargs.get("divergent_tool_calls")
+        if divergent:
+            outputs.append(ToolMessage(
+                content=(
+                    f"Gemini emitted {divergent['count']} divergent calls to "
+                    f"{divergent['name']}; cannot reconcile."
+                ),
+                name="DivergentToolCalls",
+                tool_call_id="--sentinel-for-divergent-tool-calls--",
+                additional_kwargs={
+                    "is_error": True,
+                    "is_divergent_tool_calls": True,
+                },
+            ))
+
         if self.required_tools:
             called_tool_names = {tc['name'] for tc in message.tool_calls}
             is_missing = not any(req_tool in called_tool_names for req_tool in self.required_tools)
